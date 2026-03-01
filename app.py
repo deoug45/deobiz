@@ -1,0 +1,4263 @@
+# app.py - COMPLETE WITH ALL IMPROVEMENTS
+
+import os
+import secrets
+import json
+import csv
+from datetime import datetime, timedelta
+from functools import wraps
+import io
+import base64
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_file, make_response, Response
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from supabase import create_client, Client
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch, mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.pdfgen import canvas
+import qrcode
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
+from PIL import Image
+from config import Config
+
+# ==========================================
+# FLASK APP INITIALIZATION
+# ==========================================
+
+app = Flask(__name__)
+app.config.from_object(Config)
+app.secret_key = Config.SECRET_KEY
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=Config.SESSION_LIFETIME_HOURS)
+app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
+app.config['UPLOAD_FOLDER'] = Config.UPLOAD_FOLDER
+
+# Create upload folder
+os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+os.makedirs('static', exist_ok=True)
+
+# Initialize Supabase
+supabase: Client = create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY)
+
+# ==========================================
+# DECORATORS
+# ==========================================
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in Config.ALLOWED_EXTENSIONS
+
+# ==========================================
+# HELPER FUNCTIONS - LOGO
+# ==========================================
+
+def get_logo_path():
+    """Get the path to the user's logo"""
+    logo_path = os.path.join(Config.UPLOAD_FOLDER, 'logo.png')
+    if os.path.exists(logo_path):
+        return logo_path
+    # Create default logo if not exists
+    create_default_logo()
+    return logo_path
+
+def create_default_logo():
+    """Create a default logo with company initial"""
+    img = Image.new('RGB', (512, 512), color='#0EA5E9')
+    logo_path = os.path.join(Config.UPLOAD_FOLDER, 'logo.png')
+    img.save(logo_path)
+
+def get_logo_base64():
+    """Get logo as base64 for email embedding"""
+    logo_path = get_logo_path()
+    with open(logo_path, 'rb') as f:
+        return base64.b64encode(f.read()).decode()
+
+def generate_pwa_icons():
+    """Generate PWA icons from uploaded logo"""
+    logo_path = get_logo_path()
+    logo = Image.open(logo_path)
+    
+    # Generate 192x192
+    icon_192 = logo.resize((192, 192), Image.Resampling.LANCZOS)
+    icon_192.save('static/icon-192.png')
+    
+    # Generate 512x512
+    icon_512 = logo.resize((512, 512), Image.Resampling.LANCZOS)
+    icon_512.save('static/icon-512.png')
+    
+    # Generate favicon
+    favicon = logo.resize((32, 32), Image.Resampling.LANCZOS)
+    favicon.save('static/favicon.ico', format='ICO')
+
+# ==========================================
+# HELPER FUNCTIONS - EMAIL WITH LOGO
+# ==========================================
+
+def send_email_with_logo(to_email, subject, html_content, attachment=None, filename=None):
+    try:
+        msg = MIMEMultipart('related')
+        msg['From'] = f"{Config.COMPANY_NAME} <{Config.EMAIL_SENDER}>"
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        msg_alternative = MIMEMultipart('alternative')
+        msg.attach(msg_alternative)
+        
+        # Attach HTML
+        html_part = MIMEText(html_content, 'html')
+        msg_alternative.attach(html_part)
+        
+        # Attach logo as embedded image
+        logo_path = get_logo_path()
+        with open(logo_path, 'rb') as f:
+            logo_img = MIMEImage(f.read())
+            logo_img.add_header('Content-ID', '<logo>')
+            logo_img.add_header('Content-Disposition', 'inline', filename='logo.png')
+            msg.attach(logo_img)
+        
+        # Attach PDF if provided
+        if attachment and filename:
+            pdf_part = MIMEApplication(attachment, _subtype='pdf')
+            pdf_part.add_header('Content-Disposition', 'attachment', filename=filename)
+            msg.attach(pdf_part)
+        
+        server = smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT)
+        server.starttls()
+        server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"Email error: {e}")
+        return False
+
+def get_email_template(doc_type, data):
+    """Professional email template with embedded logo"""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{ 
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+                line-height: 1.6; 
+                color: #2d3748; 
+                margin: 0; 
+                padding: 0;
+                background-color: #f7fafc;
+            }}
+            .email-container {{
+                max-width: 600px;
+                margin: 0 auto;
+                background: white;
+            }}
+            .header {{ 
+                background: linear-gradient(135deg, {Config.PRIMARY_COLOR} 0%, {Config.ACCENT_COLOR} 100%);
+                color: white; 
+                padding: 40px 30px;
+                text-align: center;
+            }}
+            .logo {{
+                width: 80px;
+                height: 80px;
+                margin: 0 auto 20px;
+                background: white;
+                border-radius: 50%;
+                padding: 10px;
+            }}
+            .header h1 {{
+                margin: 0 0 10px 0;
+                font-size: 28px;
+                font-weight: 700;
+            }}
+            .tagline {{
+                margin: 0;
+                font-size: 14px;
+                opacity: 0.95;
+                font-style: italic;
+            }}
+            .content {{ 
+                padding: 40px 30px;
+                background: white;
+            }}
+            .content h2 {{
+                color: {Config.PRIMARY_COLOR};
+                margin: 0 0 20px 0;
+                font-size: 22px;
+            }}
+            .summary {{ 
+                background: #f7fafc;
+                padding: 25px;
+                border-radius: 12px;
+                margin: 25px 0;
+                border-left: 4px solid {Config.PRIMARY_COLOR};
+            }}
+            .summary h3 {{
+                color: {Config.PRIMARY_COLOR};
+                margin: 0 0 15px 0;
+                font-size: 16px;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }}
+            .summary-item {{
+                display: flex;
+                justify-content: space-between;
+                padding: 8px 0;
+                border-bottom: 1px solid #e2e8f0;
+            }}
+            .summary-item:last-child {{
+                border-bottom: none;
+            }}
+            .summary-label {{
+                color: #718096;
+                font-size: 14px;
+            }}
+            .summary-value {{
+                color: #2d3748;
+                font-weight: 600;
+                font-size: 14px;
+            }}
+            .cta {{ 
+                text-align: center; 
+                margin: 35px 0;
+            }}
+            .button {{ 
+                background: {Config.PRIMARY_COLOR};
+                color: white; 
+                padding: 15px 40px;
+                text-decoration: none; 
+                border-radius: 8px;
+                display: inline-block;
+                font-weight: 600;
+                font-size: 15px;
+                box-shadow: 0 4px 12px rgba(14, 165, 233, 0.3);
+            }}
+            .footer {{ 
+                background: #2d3748;
+                color: white;
+                padding: 35px 30px;
+                text-align: center;
+            }}
+            .signature {{
+                margin: 20px 0;
+            }}
+            .signature-logo {{
+                width: 60px;
+                height: 60px;
+                margin: 0 auto 15px;
+                background: white;
+                border-radius: 50%;
+                padding: 8px;
+            }}
+            .signature h4 {{
+                margin: 0 0 5px 0;
+                font-size: 16px;
+                color: white;
+            }}
+            .signature p {{
+                margin: 3px 0;
+                font-size: 13px;
+                opacity: 0.9;
+            }}
+            .footer-links {{
+                margin-top: 20px;
+                padding-top: 20px;
+                border-top: 1px solid rgba(255,255,255,0.2);
+            }}
+            .footer-links a {{
+                color: white;
+                text-decoration: none;
+                margin: 0 10px;
+                font-size: 13px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="email-container">
+            <div class="header">
+                <img src="cid:logo" alt="Logo" class="logo">
+                <h1>{Config.COMPANY_NAME}</h1>
+                <p class="tagline">{Config.COMPANY_TAGLINE}</p>
+            </div>
+            
+            <div class="content">
+                <h2>{doc_type} Ready</h2>
+                <p>Dear <strong>{data.get('client_name', 'Valued Client')}</strong>,</p>
+                <p>Your {doc_type.lower()} from <strong>{Config.COMPANY_NAME}</strong> is ready. Please find it attached to this email.</p>
+                
+                <div class="summary">
+                    <h3>Document Summary</h3>
+                    <div class="summary-item">
+                        <span class="summary-label">Document Number</span>
+                        <span class="summary-value">{data.get('number', 'N/A')}</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">Date</span>
+                        <span class="summary-value">{data.get('date', datetime.now().strftime('%d %B %Y'))}</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">Amount</span>
+                        <span class="summary-value">{Config.COMPANY_CURRENCY} {data.get('total', 0):,.0f}</span>
+                    </div>
+                </div>
+                
+                <div class="cta">
+                    <a href="https://{Config.COMPANY_WEBSITE}" class="button">Visit Our Website</a>
+                </div>
+                
+                <p style="color: #718096; font-size: 14px; margin-top: 30px;">If you have any questions or concerns, please don't hesitate to reach out to us.</p>
+            </div>
+            
+            <div class="footer">
+                <div class="signature">
+                    <img src="cid:logo" alt="Logo" class="signature-logo">
+                    <h4>{Config.FOUNDER_NAME}</h4>
+                    <p>{Config.FOUNDER_TITLE}</p>
+                    <p style="margin-top: 15px;">
+                        <strong>{Config.COMPANY_NAME}</strong><br/>
+                        {Config.COMPANY_LOCATION}<br/>
+                        {Config.COMPANY_EMAIL}<br/>
+                        {Config.COMPANY_WEBSITE}
+                    </p>
+                </div>
+                
+                <div class="footer-links">
+                    <p style="font-size: 12px; opacity: 0.8; margin-bottom: 10px;">{Config.COMPANY_TAGLINE}</p>
+                    <p style="font-size: 11px; opacity: 0.7;">&copy; {datetime.now().year} {Config.COMPANY_NAME}. All rights reserved.</p>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+def get_otp_email_template(otp):
+    """OTP email with logo"""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; margin: 0; padding: 0; background: #f7fafc; }}
+            .container {{ max-width: 600px; margin: 0 auto; background: white; }}
+            .header {{ background: linear-gradient(135deg, {Config.PRIMARY_COLOR}, {Config.ACCENT_COLOR}); color: white; padding: 40px; text-align: center; }}
+            .logo {{ width: 80px; height: 80px; margin: 0 auto 20px; background: white; border-radius: 50%; padding: 10px; }}
+            .content {{ padding: 40px; text-align: center; }}
+            .otp-box {{ background: #f7fafc; padding: 30px; border-radius: 12px; margin: 30px 0; border: 2px dashed {Config.PRIMARY_COLOR}; }}
+            .otp {{ font-size: 42px; font-weight: 700; color: {Config.PRIMARY_COLOR}; letter-spacing: 15px; }}
+            .footer {{ background: #2d3748; color: white; padding: 25px; text-align: center; font-size: 13px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <img src="cid:logo" alt="Logo" class="logo">
+                <h1 style="margin: 0 0 10px 0;">{Config.COMPANY_NAME}</h1>
+                <p style="margin: 0; font-style: italic; opacity: 0.95;">{Config.COMPANY_TAGLINE}</p>
+            </div>
+            <div class="content">
+                <h2 style="color: {Config.PRIMARY_COLOR}; margin: 0 0 20px 0;">Your Login Verification Code</h2>
+                <p style="color: #718096; font-size: 15px;">Enter this code to complete your login:</p>
+                <div class="otp-box">
+                    <div class="otp">{otp}</div>
+                </div>
+                <p style="color: #718096; font-size: 14px;">This code will expire in <strong>{Config.OTP_EXPIRY_MINUTES} minutes</strong>.</p>
+                <p style="color: #e53e3e; font-size: 13px; margin-top: 30px;">⚠️ If you didn't request this code, please ignore this email.</p>
+            </div>
+            <div class="footer">
+                <img src="cid:logo" alt="Logo" style="width: 50px; height: 50px; background: white; border-radius: 50%; padding: 5px; margin-bottom: 15px;">
+                <p style="margin: 5px 0;"><strong>{Config.COMPANY_NAME}</strong></p>
+                <p style="margin: 5px 0; opacity: 0.9;">{Config.COMPANY_LOCATION}</p>
+                <p style="margin: 5px 0; opacity: 0.9;">{Config.COMPANY_EMAIL}</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+# ==========================================
+# HELPER FUNCTIONS - SECURITY
+# ==========================================
+
+def generate_otp():
+    return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
+
+def check_ip_blocked(ip_address):
+    try:
+        window_start = datetime.utcnow() - timedelta(hours=Config.LOGIN_ATTEMPT_WINDOW_HOURS)
+        result = supabase.table('login_attempts').select('*').eq('ip_address', ip_address).eq('success', False).gte('timestamp', window_start.isoformat()).execute()
+        return len(result.data) >= Config.MAX_LOGIN_ATTEMPTS
+    except:
+        return False
+
+def log_login_attempt(username, ip_address, user_agent, success):
+    try:
+        supabase.table('login_attempts').insert({
+            'username': username,
+            'ip_address': ip_address,
+            'user_agent': user_agent,
+            'success': success,
+            'timestamp': datetime.utcnow().isoformat()
+        }).execute()
+        
+        if not success:
+            result = supabase.table('login_attempts').select('*').eq('ip_address', ip_address).eq('success', False).execute()
+            if len(result.data) >= Config.MAX_LOGIN_ATTEMPTS:
+                alert_html = f"<p><strong>Security Alert:</strong> Multiple failed login attempts detected.</p><p>IP Address: {ip_address}</p><p>Username: {username}</p>"
+                send_email_with_logo(Config.COMPANY_EMAIL, 'Security Alert: Failed Login Attempts', alert_html, None, None)
+    except Exception as e:
+        print(f"Error logging attempt: {e}")
+
+# ==========================================
+# HELPER FUNCTIONS - PDF WITH LOGO (KYAMBOGO STYLE)
+# ==========================================
+
+def create_qr_code(data):
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    return buffer
+
+def generate_pdf_kyambogo_style(doc_type, data):
+    """Generate PDF with Kyambogo University style - professional receipt design"""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=15*mm, bottomMargin=15*mm, leftMargin=20*mm, rightMargin=20*mm)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # Custom styles - smaller fonts
+    header_style = ParagraphStyle(
+        'CustomHeader',
+        parent=styles['Heading1'],
+        fontSize=10,
+        textColor=colors.HexColor('#2d3748'),
+        spaceAfter=2,
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    )
+    
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=14,
+        textColor=colors.HexColor(Config.PRIMARY_COLOR),
+        spaceAfter=8,
+        spaceBefore=8,
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    )
+    
+    small_text = ParagraphStyle(
+        'SmallText',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=colors.HexColor('#4a5568'),
+        alignment=TA_CENTER
+    )
+    
+    body_text = ParagraphStyle(
+        'BodyText',
+        parent=styles['Normal'],
+        fontSize=9,
+        textColor=colors.HexColor('#2d3748'),
+        spaceAfter=4
+    )
+    
+    # Header with logo (Kyambogo style - logo at top center)
+    logo_path = get_logo_path()
+    if os.path.exists(logo_path):
+        logo = RLImage(logo_path, width=50, height=50)
+        logo.hAlign = 'CENTER'
+        story.append(logo)
+        story.append(Spacer(1, 8))
+    
+    # Company details
+    story.append(Paragraph(f"<b>{Config.COMPANY_NAME}</b>", header_style))
+    story.append(Paragraph(Config.COMPANY_TAGLINE, small_text))
+    story.append(Paragraph(f"{Config.COMPANY_LOCATION} • {Config.COMPANY_EMAIL} • {Config.COMPANY_WEBSITE}", small_text))
+    
+    # Decorative line
+    story.append(Spacer(1, 8))
+    line_table = Table([['']], colWidths=[doc.width])
+    line_table.setStyle(TableStyle([
+        ('LINEABOVE', (0, 0), (-1, 0), 2, colors.HexColor(Config.PRIMARY_COLOR)),
+        ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.HexColor(Config.ACCENT_COLOR)),
+    ]))
+    story.append(line_table)
+    story.append(Spacer(1, 8))
+    
+    # Document title with colored background
+    title_table = Table([[Paragraph(f"<b>{doc_type.upper()}</b>", title_style)]], colWidths=[doc.width])
+    title_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e6f7ff')),
+        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor(Config.PRIMARY_COLOR)),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(title_table)
+    story.append(Spacer(1, 10))
+    
+    # Document info table
+    info_data = [
+        [Paragraph(f"<b>Document No:</b>", body_text), Paragraph(data.get('number', 'N/A'), body_text), 
+         Paragraph(f"<b>Date:</b>", body_text), Paragraph(data.get('date', datetime.utcnow().strftime('%d/%m/%Y'))[:10], body_text)]
+    ]
+    
+    if 'client_name' in data:
+        info_data.append([Paragraph(f"<b>Client:</b>", body_text), Paragraph(data['client_name'], body_text), '', ''])
+    
+    info_table = Table(info_data, colWidths=[doc.width*0.25, doc.width*0.25, doc.width*0.25, doc.width*0.25])
+    info_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f7fafc')),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e0')),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(info_table)
+    story.append(Spacer(1, 12))
+    
+    # Items table (if applicable)
+    if 'items' in data and data['items']:
+        table_data = [
+            [Paragraph('<b>Description</b>', body_text), 
+             Paragraph('<b>Qty</b>', body_text), 
+             Paragraph('<b>Rate</b>', body_text), 
+             Paragraph('<b>Amount</b>', body_text)]
+        ]
+        
+        for item in data['items']:
+            table_data.append([
+                Paragraph(item.get('description', ''), body_text),
+                Paragraph(str(item.get('quantity', 1)), body_text),
+                Paragraph(f"{Config.COMPANY_CURRENCY} {item.get('rate', 0):,.0f}", body_text),
+                Paragraph(f"{Config.COMPANY_CURRENCY} {item.get('amount', 0):,.0f}", body_text)
+            ])
+        
+        items_table = Table(table_data, colWidths=[doc.width*0.46, doc.width*0.18, doc.width*0.18, doc.width*0.18])
+        items_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(Config.PRIMARY_COLOR)),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e0')),
+        ]))
+        story.append(items_table)
+        story.append(Spacer(1, 10))
+        
+        # Totals table
+        totals_data = []
+        if 'subtotal' in data:
+            totals_data.append(['', '', Paragraph('<b>Subtotal:</b>', body_text), Paragraph(f"{Config.COMPANY_CURRENCY} {data['subtotal']:,.0f}", body_text)])
+        if 'tax' in data and data['tax'] > 0:
+            totals_data.append(['', '', Paragraph('<b>Tax:</b>', body_text), Paragraph(f"{Config.COMPANY_CURRENCY} {data['tax']:,.0f}", body_text)])
+        if 'discount' in data and data['discount'] > 0:
+            totals_data.append(['', '', Paragraph('<b>Discount:</b>', body_text), Paragraph(f"- {Config.COMPANY_CURRENCY} {data['discount']:,.0f}", body_text)])
+        if 'total' in data:
+            totals_data.append(['', '', Paragraph('<b>TOTAL:</b>', title_style), Paragraph(f"<b>{Config.COMPANY_CURRENCY} {data['total']:,.0f}</b>", title_style)])
+        
+        totals_table = Table(totals_data, colWidths=[doc.width*0.46, doc.width*0.18, doc.width*0.18, doc.width*0.18])
+        totals_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('LINEABOVE', (2, -1), (-1, -1), 2, colors.HexColor(Config.PRIMARY_COLOR)),
+            ('BACKGROUND', (2, -1), (-1, -1), colors.HexColor('#e6f7ff')),
+        ]))
+        story.append(totals_table)
+    
+    elif 'amount' in data:
+        # For receipts - simple amount display
+        amount_data = [[
+            Paragraph('<b>Amount Paid:</b>', title_style),
+            Paragraph(f"<b>{Config.COMPANY_CURRENCY} {data['amount']:,.0f}</b>", title_style)
+        ]]
+        if 'payment_method' in data:
+            amount_data.append([
+                Paragraph('<b>Payment Method:</b>', body_text),
+                Paragraph(data['payment_method'], body_text)
+            ])
+        
+        amount_table = Table(amount_data, colWidths=[doc.width*0.5, doc.width*0.5])
+        amount_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e6f7ff')),
+            ('BOX', (0, 0), (-1, -1), 1.5, colors.HexColor(Config.PRIMARY_COLOR)),
+            ('TOPPADDING', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ]))
+        story.append(amount_table)
+    
+    story.append(Spacer(1, 20))
+    
+    # QR Code centered
+    qr_data = f"{doc_type}:{data.get('number', 'N/A')}:{datetime.utcnow().isoformat()}"
+    qr_buffer = create_qr_code(qr_data)
+    qr_img = RLImage(qr_buffer, width=60, height=60)
+    qr_img.hAlign = 'CENTER'
+    story.append(qr_img)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Scan for verification", small_text))
+    
+    story.append(Spacer(1, 15))
+    
+    # Footer with logo (Kyambogo style)
+    footer_table = Table([
+        [Paragraph("This is a computer-generated document. No signature required.", small_text)],
+        [Paragraph(f"<b>{Config.COMPANY_NAME}</b> • {Config.COMPANY_TAGLINE}", small_text)],
+        [Paragraph(f"{Config.COMPANY_LOCATION} • {Config.COMPANY_EMAIL} • {Config.COMPANY_WEBSITE}", small_text)]
+    ], colWidths=[doc.width])
+    footer_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f7fafc')),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('LINEABOVE', (0, 0), (-1, 0), 1, colors.HexColor(Config.PRIMARY_COLOR)),
+    ]))
+    story.append(footer_table)
+    
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ==========================================
+# HELPER FUNCTIONS - PRICING CALCULATOR
+# ==========================================
+
+def calculate_smart_price(project_type, estimated_hours, complexity, urgency, revisions):
+    """Smart pricing engine to help avoid undercharging"""
+    base_rates = {
+        'Web Development': 50000,
+        'Mobile App': 75000,
+        'UI/UX Design': 40000,
+        'Branding': 60000,
+        'SEO/Marketing': 45000,
+        'Content Creation': 35000,
+        'Consulting': 80000,
+        'Other': 50000
+    }
+    
+    complexity_multipliers = {
+        'Simple': 1.0,
+        'Medium': 1.5,
+        'Complex': 2.0,
+        'Very Complex': 2.5
+    }
+    
+    urgency_multipliers = {
+        'Standard': 1.0,
+        'Rush (1 week)': 1.3,
+        'Urgent (3 days)': 1.5,
+        'Emergency (24hrs)': 2.0
+    }
+    
+    revision_cost = max(0, (revisions - 2)) * 20000
+    
+    base_rate = base_rates.get(project_type, 50000)
+    complexity_multiplier = complexity_multipliers.get(complexity, 1.0)
+    urgency_multiplier = urgency_multipliers.get(urgency, 1.0)
+    
+    base_price = base_rate * estimated_hours * complexity_multiplier * urgency_multiplier
+    total_price = base_price + revision_cost
+    
+    min_price = total_price * 0.85
+    max_price = total_price * 1.15
+    
+    return {
+        'suggested_price': round(total_price, -3),
+        'min_price': round(min_price, -3),
+        'max_price': round(max_price, -3),
+        'breakdown': {
+            'base_rate_per_hour': base_rate,
+            'total_hours': estimated_hours,
+            'complexity_multiplier': complexity_multiplier,
+            'urgency_multiplier': urgency_multiplier,
+            'revision_cost': revision_cost,
+            'base_before_revisions': round(base_price, -3)
+        }
+    }
+
+# ==========================================
+# HELPER FUNCTIONS - ANALYTICS
+# ==========================================
+
+def get_dashboard_analytics():
+    """Get comprehensive dashboard analytics with UTC timezone"""
+    try:
+        invoices = supabase.table('invoices').select('*').execute()
+        expenses = supabase.table('expenses').select('*').execute()
+        clients = supabase.table('clients').select('*').execute()
+        
+        today = datetime.utcnow().date()
+        week_start = today - timedelta(days=today.weekday())
+        month_start = today.replace(day=1)
+        last_month_start = (month_start - timedelta(days=1)).replace(day=1)
+        
+        # Revenue calculations
+        today_revenue = sum([inv['total'] for inv in invoices.data if inv['status'] == 'paid' and datetime.fromisoformat(inv['date'].replace('Z', '+00:00')).date() == today])
+        week_revenue = sum([inv['total'] for inv in invoices.data if inv['status'] == 'paid' and datetime.fromisoformat(inv['date'].replace('Z', '+00:00')).date() >= week_start])
+        month_revenue = sum([inv['total'] for inv in invoices.data if inv['status'] == 'paid' and datetime.fromisoformat(inv['date'].replace('Z', '+00:00')).date() >= month_start])
+        last_month_revenue = sum([inv['total'] for inv in invoices.data if inv['status'] == 'paid' and last_month_start <= datetime.fromisoformat(inv['date'].replace('Z', '+00:00')).date() < month_start])
+        
+        # Expense calculations
+        month_expenses = sum([exp['amount'] for exp in expenses.data if datetime.fromisoformat(exp['date'].replace('Z', '+00:00')).date() >= month_start])
+        total_expenses = sum([exp['amount'] for exp in expenses.data])
+        
+        # Profit calculations
+        net_profit = month_revenue - month_expenses
+        profit_margin = (net_profit / month_revenue * 100) if month_revenue > 0 else 0
+        
+        # Growth calculations
+        revenue_growth = ((month_revenue - last_month_revenue) / last_month_revenue * 100) if last_month_revenue > 0 else 0
+        
+        # Outstanding invoices
+        outstanding = sum([inv['total'] for inv in invoices.data if inv['status'] == 'pending'])
+        
+        # Top clients
+        client_revenue = {}
+        for inv in invoices.data:
+            if inv['status'] == 'paid':
+                client_id = inv.get('client_id')
+                if client_id:
+                    client_revenue[client_id] = client_revenue.get(client_id, 0) + inv['total']
+        
+        top_clients = sorted(client_revenue.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_clients_data = []
+        for client_id, revenue in top_clients:
+            client = next((c for c in clients.data if c['id'] == client_id), None)
+            if client:
+                top_clients_data.append({'name': client['name'], 'revenue': revenue})
+        
+        # Revenue by month (last 6 months)
+        monthly_revenue = []
+        for i in range(6):
+            month_date = today.replace(day=1) - timedelta(days=30*i)
+            month_start_date = month_date.replace(day=1)
+            next_month = (month_start_date + timedelta(days=32)).replace(day=1)
+            
+            month_rev = sum([inv['total'] for inv in invoices.data if inv['status'] == 'paid' and month_start_date <= datetime.fromisoformat(inv['date'].replace('Z', '+00:00')).date() < next_month])
+            monthly_revenue.insert(0, {
+                'month': month_start_date.strftime('%b %Y'),
+                'revenue': month_rev
+            })
+        
+        # Expense by category
+        expense_by_category = {}
+        for exp in expenses.data:
+            category = exp['category']
+            expense_by_category[category] = expense_by_category.get(category, 0) + exp['amount']
+        
+        # Business health score
+        health_score = min(100, max(0, 50 + profit_margin))
+        
+        return {
+            'today_revenue': today_revenue,
+            'week_revenue': week_revenue,
+            'month_revenue': month_revenue,
+            'total_expenses': total_expenses,
+            'month_expenses': month_expenses,
+            'net_profit': net_profit,
+            'profit_margin': profit_margin,
+            'revenue_growth': revenue_growth,
+            'outstanding': outstanding,
+            'health_score': health_score,
+            'total_clients': len(clients.data),
+            'top_clients': top_clients_data,
+            'monthly_revenue': monthly_revenue,
+            'expense_by_category': expense_by_category
+        }
+    except Exception as e:
+        print(f"Analytics error: {e}")
+        return None
+
+# ==========================================
+# HELPER FUNCTIONS - CEO REPORT
+# ==========================================
+
+def generate_ceo_report():
+    try:
+        analytics = get_dashboard_analytics()
+        if not analytics:
+            return
+        
+        today = datetime.utcnow().date()
+        
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: 'Segoe UI', sans-serif; margin: 0; padding: 0; background: #f7fafc; }}
+                .container {{ max-width: 700px; margin: 0 auto; background: white; }}
+                .header {{ background: linear-gradient(135deg, {Config.PRIMARY_COLOR}, {Config.ACCENT_COLOR}); color: white; padding: 40px; text-align: center; }}
+                .logo {{ width: 80px; height: 80px; margin: 0 auto 20px; background: white; border-radius: 50%; padding: 10px; }}
+                .content {{ padding: 40px; }}
+                .metric {{ background: #f7fafc; padding: 20px; margin: 15px 0; border-radius: 12px; border-left: 4px solid {Config.PRIMARY_COLOR}; }}
+                .insights {{ background: #fff3cd; padding: 25px; border-radius: 12px; margin: 25px 0; }}
+                .footer {{ background: #2d3748; color: white; padding: 30px; text-align: center; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <img src="cid:logo" alt="Logo" class="logo">
+                    <h1 style="margin: 0 0 10px 0;">Daily CEO Report</h1>
+                    <p style="margin: 0; opacity: 0.95;">{Config.COMPANY_NAME} • {today.strftime('%d %B %Y')}</p>
+                </div>
+                <div class="content">
+                    <h2 style="color: {Config.PRIMARY_COLOR}; margin-bottom: 25px;">Today's Performance</h2>
+                    
+                    <div class="metric">
+                        <h3 style="margin: 0 0 10px 0; color: {Config.PRIMARY_COLOR};">Revenue: {Config.COMPANY_CURRENCY} {analytics['today_revenue']:,.0f}</h3>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3 style="margin: 0 0 10px 0; color: {Config.PRIMARY_COLOR};">Monthly Revenue: {Config.COMPANY_CURRENCY} {analytics['month_revenue']:,.0f}</h3>
+                        <p style="margin: 0; color: #718096;">Growth: {analytics['revenue_growth']:.1f}%</p>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3 style="margin: 0 0 10px 0; color: {Config.PRIMARY_COLOR};">Expenses: {Config.COMPANY_CURRENCY} {analytics['month_expenses']:,.0f}</h3>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3 style="margin: 0 0 10px 0; color: {Config.PRIMARY_COLOR};">Net Profit: {Config.COMPANY_CURRENCY} {analytics['net_profit']:,.0f}</h3>
+                        <p style="margin: 0; color: #718096;">Margin: {analytics['profit_margin']:.1f}%</p>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3 style="margin: 0 0 10px 0; color: {Config.PRIMARY_COLOR};">Outstanding: {Config.COMPANY_CURRENCY} {analytics['outstanding']:,.0f}</h3>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3 style="margin: 0 0 10px 0; color: {Config.PRIMARY_COLOR};">Business Health Score: {analytics['health_score']:.0f}/100</h3>
+                    </div>
+                    
+                    <div class="insights">
+                        <h3 style="color: #856404; margin: 0 0 15px 0;">📊 AI Insights & Recommendations</h3>
+                        <ul style="margin: 0; padding-left: 20px; color: #856404;">
+                            <li style="margin: 8px 0;"><strong>Maintain:</strong> {'Strong profit margins' if analytics['profit_margin'] > 20 else 'Focus on cost control'}</li>
+                            <li style="margin: 8px 0;"><strong>Improve:</strong> {'Follow up on outstanding invoices' if analytics['outstanding'] > 0 else 'Excellent payment collection'}</li>
+                            <li style="margin: 8px 0;"><strong>Action:</strong> {'Consider increasing capacity' if analytics['month_revenue'] > analytics['month_expenses'] * 3 else 'Focus on revenue generation'}</li>
+                            <li style="margin: 8px 0;"><strong>Growth:</strong> {'Excellent growth momentum' if analytics['revenue_growth'] > 10 else 'Focus on client acquisition'}</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="footer">
+                    <img src="cid:logo" alt="Logo" style="width: 60px; height: 60px; background: white; border-radius: 50%; padding: 8px; margin-bottom: 15px;">
+                    <p style="margin: 5px 0;"><strong>{Config.COMPANY_NAME}</strong></p>
+                    <p style="margin: 5px 0; opacity: 0.9; font-style: italic;">{Config.COMPANY_TAGLINE}</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        send_email_with_logo(Config.COMPANY_EMAIL, f'Daily CEO Report - {today.strftime("%d %B %Y")}', html_content, None, None)
+    except Exception as e:
+        print(f"Error generating CEO report: {e}")
+
+# ==========================================
+# DATABASE INITIALIZATION
+# ==========================================
+
+def init_db():
+    tables = [
+        'users', 'clients', 'services', 'quotations', 
+        'invoices', 'receipts', 'expenses', 
+        'login_attempts', 'otps', 'settings'
+    ]
+    
+    for table in tables:
+        try:
+            supabase.table(table).select('*').limit(1).execute()
+        except Exception as e:
+            print(f"Table {table} check: {e}")
+
+# ==========================================
+# SCHEDULER
+# ==========================================
+
+scheduler = BackgroundScheduler()
+if Config.CEO_REPORT_ENABLED:
+    scheduler.add_job(
+        func=generate_ceo_report, 
+        trigger="cron", 
+        hour=Config.CEO_REPORT_HOUR, 
+        minute=Config.CEO_REPORT_MINUTE, 
+        timezone=pytz.UTC
+    )
+scheduler.start()
+
+# Initialize
+create_default_logo()
+generate_pwa_icons()
+
+# ==========================================
+# ROUTES - FILE UPLOAD
+# ==========================================
+
+@app.route('/upload-logo', methods=['POST'])
+@login_required
+def upload_logo():
+    try:
+        if 'logo' not in request.files:
+            return jsonify({'error': 'No file'}), 400
+        
+        file = request.files['logo']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if file:
+            # Save logo
+            logo_path = os.path.join(Config.UPLOAD_FOLDER, 'logo.png')
+            img = Image.open(file)
+            img = img.convert('RGB')
+            img.save(logo_path, 'PNG')
+            
+            # Regenerate PWA icons
+            generate_pwa_icons()
+            
+            return jsonify({'success': True, 'message': 'Logo uploaded successfully'})
+        
+        return jsonify({'error': 'Invalid file'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==========================================
+# ROUTES - AUTH
+# ==========================================
+
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    try:
+        users = supabase.table('users').select('*').execute()
+        if len(users.data) > 0:
+            return redirect(url_for('login'))
+    except:
+        pass
+    
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        hashed = generate_password_hash(password)
+        
+        try:
+            supabase.table('users').insert({
+                'username': username,
+                'password': hashed,
+                'created_at': datetime.utcnow().isoformat()
+            }).execute()
+            
+            return redirect(url_for('login'))
+        except Exception as e:
+            return f"Setup error: {e}"
+    
+    return render_template_string(SETUP_TEMPLATE)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        ip_address = request.remote_addr
+        user_agent = request.headers.get('User-Agent', '')
+        
+        if check_ip_blocked(ip_address):
+            return render_template_string(LOGIN_TEMPLATE, error='Too many failed attempts. Please try again later.')
+        
+        try:
+            user = supabase.table('users').select('*').eq('username', username).execute()
+            
+            if len(user.data) > 0 and check_password_hash(user.data[0]['password'], password):
+                otp = generate_otp()
+                expires_at = datetime.utcnow() + timedelta(minutes=Config.OTP_EXPIRY_MINUTES)
+                
+                supabase.table('otps').insert({
+                    'user_id': user.data[0]['id'],
+                    'otp': otp,
+                    'expires_at': expires_at.isoformat(),
+                    'used': False
+                }).execute()
+                
+                html = get_otp_email_template(otp)
+                send_email_with_logo(Config.COMPANY_EMAIL, f'Your Login Code for {Config.COMPANY_NAME}', html, None, None)
+                
+                session['temp_user_id'] = user.data[0]['id']
+                log_login_attempt(username, ip_address, user_agent, True)
+                return redirect(url_for('verify_otp'))
+            else:
+                log_login_attempt(username, ip_address, user_agent, False)
+                return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
+        except Exception as e:
+            return render_template_string(LOGIN_TEMPLATE, error=f'Login error: {e}')
+    
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/verify-otp', methods=['GET', 'POST'])
+def verify_otp():
+    if 'temp_user_id' not in session:
+        return redirect(url_for('login'))
+    
+    if request.method == 'POST':
+        otp = request.form.get('otp')
+        
+        try:
+            result = supabase.table('otps').select('*').eq('user_id', session['temp_user_id']).eq('otp', otp).eq('used', False).execute()
+            
+            if len(result.data) > 0:
+                otp_data = result.data[0]
+                expires_at = datetime.fromisoformat(otp_data['expires_at'].replace('Z', '+00:00'))
+                
+                if datetime.utcnow().replace(tzinfo=pytz.UTC) < expires_at.replace(tzinfo=pytz.UTC):
+                    supabase.table('otps').update({'used': True}).eq('id', otp_data['id']).execute()
+                    session['user_id'] = session['temp_user_id']
+                    session.pop('temp_user_id', None)
+                    session.permanent = True
+                    return redirect(url_for('dashboard'))
+                else:
+                    return render_template_string(OTP_TEMPLATE, error='OTP expired. Please login again.')
+            else:
+                alert_html = f"<p><strong>Failed OTP attempt</strong> for user ID: {session['temp_user_id']}</p>"
+                send_email_with_logo(Config.COMPANY_EMAIL, 'Failed OTP Verification Attempt', alert_html, None, None)
+                return render_template_string(OTP_TEMPLATE, error='Invalid OTP')
+        except Exception as e:
+            return render_template_string(OTP_TEMPLATE, error=f'Verification error: {e}')
+    
+    return render_template_string(OTP_TEMPLATE)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+# Continue with remaining routes in next message...
+
+# Continue app.py - REMAINING ROUTES
+
+# ==========================================
+# ROUTES - DASHBOARD
+# ==========================================
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    try:
+        analytics = get_dashboard_analytics()
+        if not analytics:
+            return "Error loading dashboard"
+        
+        return render_template_string(DASHBOARD_TEMPLATE, **analytics)
+    except Exception as e:
+        return f"Dashboard error: {e}"
+
+@app.route('/api/dashboard-data')
+@login_required
+def dashboard_data():
+    """API endpoint for dashboard analytics"""
+    analytics = get_dashboard_analytics()
+    return jsonify(analytics)
+
+# ==========================================
+# ROUTES - CLIENTS
+# ==========================================
+
+@app.route('/clients')
+@login_required
+def clients():
+    try:
+        result = supabase.table('clients').select('*').execute()
+        return render_template_string(CLIENTS_TEMPLATE, clients=result.data)
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/clients/add', methods=['POST'])
+@login_required
+def add_client():
+    try:
+        data = {
+            'name': request.form.get('name'),
+            'email': request.form.get('email'),
+            'phone': request.form.get('phone'),
+            'company': request.form.get('company'),
+            'label': request.form.get('label', 'New'),
+            'created_at': datetime.utcnow().isoformat()
+        }
+        supabase.table('clients').insert(data).execute()
+        return redirect(url_for('clients'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/clients/edit/<int:client_id>', methods=['POST'])
+@login_required
+def edit_client(client_id):
+    try:
+        data = {
+            'name': request.form.get('name'),
+            'email': request.form.get('email'),
+            'phone': request.form.get('phone'),
+            'company': request.form.get('company'),
+            'label': request.form.get('label')
+        }
+        supabase.table('clients').update(data).eq('id', client_id).execute()
+        return redirect(url_for('clients'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/clients/delete/<int:client_id>')
+@login_required
+def delete_client(client_id):
+    try:
+        supabase.table('clients').delete().eq('id', client_id).execute()
+        return redirect(url_for('clients'))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+
+# ==========================================
+# ROUTES - PRICING CALCULATOR
+# ==========================================
+
+@app.route('/pricing-calculator')
+@login_required
+def pricing_calculator():
+    return render_template_string(PRICING_CALCULATOR_TEMPLATE)
+
+@app.route('/api/calculate-price', methods=['POST'])
+@login_required
+def api_calculate_price():
+    try:
+        data = request.json
+        result = calculate_smart_price(
+            data['project_type'],
+            float(data['estimated_hours']),
+            data['complexity'],
+            data['urgency'],
+            int(data['revisions'])
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+# ==========================================
+# ROUTES - QUOTATIONS
+# ==========================================
+
+@app.route('/quotations')
+@login_required
+def quotations():
+    try:
+        result = supabase.table('quotations').select('*').execute()
+        clients_result = supabase.table('clients').select('*').execute()
+        return render_template_string(QUOTATIONS_TEMPLATE, quotations=result.data, clients=clients_result.data)
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/quotations/add', methods=['POST'])
+@login_required
+def add_quotation():
+    try:
+        result = supabase.table('quotations').select('*').execute()
+        quot_number = f"QT{len(result.data) + 1:05d}"
+        
+        items = json.loads(request.form.get('items', '[]'))
+        subtotal = sum([item['amount'] for item in items])
+        tax = float(request.form.get('tax', 0))
+        discount = float(request.form.get('discount', 0))
+        total = subtotal + tax - discount
+        
+        data = {
+            'number': quot_number,
+            'client_id': int(request.form.get('client_id')),
+            'date': datetime.utcnow().isoformat(),
+            'validity_date': request.form.get('validity_date'),
+            'items': json.dumps(items),
+            'subtotal': subtotal,
+            'tax': tax,
+            'discount': discount,
+            'total': total,
+            'status': 'pending'
+        }
+        
+        supabase.table('quotations').insert(data).execute()
+        return redirect(url_for('quotations'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/quotations/convert/<int:quot_id>')
+@login_required
+def convert_quotation_to_invoice(quot_id):
+    try:
+        quot = supabase.table('quotations').select('*').eq('id', quot_id).execute().data[0]
+        
+        inv_result = supabase.table('invoices').select('*').execute()
+        inv_number = f"INV{len(inv_result.data) + 1:05d}"
+        
+        invoice_data = {
+            'number': inv_number,
+            'client_id': quot['client_id'],
+            'date': datetime.utcnow().isoformat(),
+            'items': quot['items'],
+            'subtotal': quot['subtotal'],
+            'tax': quot['tax'],
+            'discount': quot['discount'],
+            'total': quot['total'],
+            'status': 'pending',
+            'quotation_id': quot_id
+        }
+        
+        supabase.table('invoices').insert(invoice_data).execute()
+        supabase.table('quotations').update({'status': 'converted'}).eq('id', quot_id).execute()
+        
+        return redirect(url_for('invoices'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/quotations/pdf/<int:quot_id>')
+@login_required
+def quotation_pdf(quot_id):
+    try:
+        quot = supabase.table('quotations').select('*').eq('id', quot_id).execute().data[0]
+        client = supabase.table('clients').select('*').eq('id', quot['client_id']).execute().data[0]
+        
+        pdf_data = {
+            'number': quot['number'],
+            'client_name': client['name'],
+            'date': quot['date'][:10],
+            'items': json.loads(quot['items']),
+            'subtotal': quot['subtotal'],
+            'tax': quot['tax'],
+            'discount': quot['discount'],
+            'total': quot['total']
+        }
+        
+        pdf = generate_pdf_kyambogo_style('Quotation', pdf_data)
+        
+        return send_file(
+            io.BytesIO(pdf),
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f'Quotation_{quot["number"]}.pdf'
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/quotations/email/<int:quot_id>')
+@login_required
+def email_quotation(quot_id):
+    try:
+        quot = supabase.table('quotations').select('*').eq('id', quot_id).execute().data[0]
+        client = supabase.table('clients').select('*').eq('id', quot['client_id']).execute().data[0]
+        
+        pdf_data = {
+            'number': quot['number'],
+            'client_name': client['name'],
+            'date': quot['date'][:10],
+            'items': json.loads(quot['items']),
+            'subtotal': quot['subtotal'],
+            'tax': quot['tax'],
+            'discount': quot['discount'],
+            'total': quot['total']
+        }
+        
+        pdf = generate_pdf_kyambogo_style('Quotation', pdf_data)
+        html = get_email_template('Quotation', pdf_data)
+        
+        send_email_with_logo(client['email'], f'Quotation {quot["number"]} from {Config.COMPANY_NAME}', html, pdf, f'Quotation_{quot["number"]}.pdf')
+        
+        return redirect(url_for('quotations'))
+    except Exception as e:
+        return f"Error: {e}"
+
+# ==========================================
+# ROUTES - INVOICES
+# ==========================================
+
+@app.route('/invoices')
+@login_required
+def invoices():
+    try:
+        result = supabase.table('invoices').select('*').execute()
+        clients_result = supabase.table('clients').select('*').execute()
+        return render_template_string(INVOICES_TEMPLATE, invoices=result.data, clients=clients_result.data)
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/invoices/add', methods=['POST'])
+@login_required
+def add_invoice():
+    try:
+        result = supabase.table('invoices').select('*').execute()
+        inv_number = f"INV{len(result.data) + 1:05d}"
+        
+        items = json.loads(request.form.get('items', '[]'))
+        subtotal = sum([item['amount'] for item in items])
+        tax = float(request.form.get('tax', 0))
+        discount = float(request.form.get('discount', 0))
+        total = subtotal + tax - discount
+        
+        data = {
+            'number': inv_number,
+            'client_id': int(request.form.get('client_id')),
+            'date': datetime.utcnow().isoformat(),
+            'items': json.dumps(items),
+            'subtotal': subtotal,
+            'tax': tax,
+            'discount': discount,
+            'total': total,
+            'status': 'pending'
+        }
+        
+        supabase.table('invoices').insert(data).execute()
+        return redirect(url_for('invoices'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/invoices/mark-paid/<int:inv_id>')
+@login_required
+def mark_invoice_paid(inv_id):
+    try:
+        supabase.table('invoices').update({'status': 'paid', 'paid_date': datetime.utcnow().isoformat()}).eq('id', inv_id).execute()
+        
+        invoice = supabase.table('invoices').select('*').eq('id', inv_id).execute().data[0]
+        result = supabase.table('receipts').select('*').execute()
+        rec_number = f"REC{len(result.data) + 1:05d}"
+        
+        receipt_data = {
+            'number': rec_number,
+            'invoice_id': inv_id,
+            'date': datetime.utcnow().isoformat(),
+            'amount': invoice['total'],
+            'payment_method': request.args.get('method', 'Bank Transfer')
+        }
+        
+        supabase.table('receipts').insert(receipt_data).execute()
+        
+        # Auto-send receipt email
+        client = supabase.table('clients').select('*').eq('id', invoice['client_id']).execute().data[0]
+        pdf_data = {
+            'number': rec_number,
+            'client_name': client['name'],
+            'date': receipt_data['date'][:10],
+            'amount': receipt_data['amount'],
+            'payment_method': receipt_data['payment_method']
+        }
+        pdf = generate_pdf_kyambogo_style('Receipt', pdf_data)
+        html = get_email_template('Receipt', pdf_data)
+        send_email_with_logo(client['email'], f'Receipt {rec_number} from {Config.COMPANY_NAME}', html, pdf, f'Receipt_{rec_number}.pdf')
+        
+        return redirect(url_for('invoices'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/invoices/pdf/<int:inv_id>')
+@login_required
+def invoice_pdf(inv_id):
+    try:
+        invoice = supabase.table('invoices').select('*').eq('id', inv_id).execute().data[0]
+        client = supabase.table('clients').select('*').eq('id', invoice['client_id']).execute().data[0]
+        
+        pdf_data = {
+            'number': invoice['number'],
+            'client_name': client['name'],
+            'date': invoice['date'][:10],
+            'items': json.loads(invoice['items']),
+            'subtotal': invoice['subtotal'],
+            'tax': invoice['tax'],
+            'discount': invoice['discount'],
+            'total': invoice['total']
+        }
+        
+        pdf = generate_pdf_kyambogo_style('Invoice', pdf_data)
+        
+        return send_file(
+            io.BytesIO(pdf),
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f'Invoice_{invoice["number"]}.pdf'
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/invoices/email/<int:inv_id>')
+@login_required
+def email_invoice(inv_id):
+    try:
+        invoice = supabase.table('invoices').select('*').eq('id', inv_id).execute().data[0]
+        client = supabase.table('clients').select('*').eq('id', invoice['client_id']).execute().data[0]
+        
+        pdf_data = {
+            'number': invoice['number'],
+            'client_name': client['name'],
+            'date': invoice['date'][:10],
+            'items': json.loads(invoice['items']),
+            'subtotal': invoice['subtotal'],
+            'tax': invoice['tax'],
+            'discount': invoice['discount'],
+            'total': invoice['total']
+        }
+        
+        pdf = generate_pdf_kyambogo_style('Invoice', pdf_data)
+        html = get_email_template('Invoice', pdf_data)
+        
+        send_email_with_logo(client['email'], f'Invoice {invoice["number"]} from {Config.COMPANY_NAME}', html, pdf, f'Invoice_{invoice["number"]}.pdf')
+        
+        return redirect(url_for('invoices'))
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/invoices/whatsapp/<int:inv_id>')
+@login_required
+def whatsapp_invoice(inv_id):
+    try:
+        invoice = supabase.table('invoices').select('*').eq('id', inv_id).execute().data[0]
+        client = supabase.table('clients').select('*').eq('id', invoice['client_id']).execute().data[0]
+        
+        message = f"Hello {client['name']}, your invoice {invoice['number']} for {Config.COMPANY_CURRENCY} {invoice['total']:,.0f} is ready. Please check your email for details."
+        phone = client['phone'].replace('+', '').replace(' ', '')
+        
+        whatsapp_url = f"https://wa.me/{phone}?text={message}"
+        return redirect(whatsapp_url)
+    except Exception as e:
+        return f"Error: {e}"
+
+# ==========================================
+# ROUTES - RECEIPTS
+# ==========================================
+
+@app.route('/receipts')
+@login_required
+def receipts():
+    try:
+        result = supabase.table('receipts').select('*').execute()
+        return render_template_string(RECEIPTS_TEMPLATE, receipts=result.data)
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/receipts/pdf/<int:rec_id>')
+@login_required
+def receipt_pdf(rec_id):
+    try:
+        receipt = supabase.table('receipts').select('*').eq('id', rec_id).execute().data[0]
+        invoice = supabase.table('invoices').select('*').eq('id', receipt['invoice_id']).execute().data[0]
+        client = supabase.table('clients').select('*').eq('id', invoice['client_id']).execute().data[0]
+        
+        pdf_data = {
+            'number': receipt['number'],
+            'client_name': client['name'],
+            'date': receipt['date'][:10],
+            'amount': receipt['amount'],
+            'payment_method': receipt['payment_method']
+        }
+        
+        pdf = generate_pdf_kyambogo_style('Receipt', pdf_data)
+        
+        return send_file(
+            io.BytesIO(pdf),
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f'Receipt_{receipt["number"]}.pdf'
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+# ==========================================
+# ROUTES - EXPENSES
+# ==========================================
+
+@app.route('/expenses')
+@login_required
+def expenses():
+    try:
+        result = supabase.table('expenses').select('*').execute()
+        
+        total = sum([exp['amount'] for exp in result.data])
+        by_category = {}
+        for exp in result.data:
+            cat = exp['category']
+            by_category[cat] = by_category.get(cat, 0) + exp['amount']
+        
+        return render_template_string(EXPENSES_TEMPLATE, expenses=result.data, total=total, by_category=by_category)
+    except Exception as e:
+        return f"Error: {e}"
+
+@app.route('/expenses/add', methods=['POST'])
+@login_required
+def add_expense():
+    try:
+        data = {
+            'category': request.form.get('category'),
+            'description': request.form.get('description'),
+            'amount': float(request.form.get('amount')),
+            'date': datetime.utcnow().isoformat()
+        }
+        supabase.table('expenses').insert(data).execute()
+        return redirect(url_for('expenses'))
+    except Exception as e:
+        return f"Error: {e}"
+
+# ==========================================
+# ROUTES - REPORTS
+# ==========================================
+
+@app.route('/reports')
+@login_required
+def reports():
+    return render_template_string(REPORTS_TEMPLATE)
+
+@app.route('/reports/generate', methods=['POST'])
+@login_required
+def generate_report():
+    try:
+        report_type = request.form.get('report_type')
+        start_date = request.form.get('start_date')
+        end_date = request.form.get('end_date')
+        
+        if report_type == 'revenue':
+            invoices = supabase.table('invoices').select('*').execute()
+            data = [inv for inv in invoices.data if inv['status'] == 'paid' and start_date <= inv['date'][:10] <= end_date]
+        elif report_type == 'expenses':
+            expenses = supabase.table('expenses').select('*').execute()
+            data = [exp for exp in expenses.data if start_date <= exp['date'][:10] <= end_date]
+        elif report_type == 'clients':
+            data = supabase.table('clients').select('*').execute().data
+        else:
+            return "Invalid report type"
+        
+        output = io.StringIO()
+        if data:
+            writer = csv.DictWriter(output, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+        
+        response = Response(output.getvalue(), mimetype='text/csv')
+        response.headers['Content-Disposition'] = f'attachment; filename={report_type}_report_{datetime.utcnow().strftime("%Y%m%d")}.csv'
+        return response
+        
+    except Exception as e:
+        return f"Error: {e}"
+
+# ==========================================
+# ROUTES - SECURITY
+# ==========================================
+
+@app.route('/security')
+@login_required
+def security():
+    try:
+        attempts = supabase.table('login_attempts').select('*').order('timestamp', desc=True).limit(50).execute()
+        return render_template_string(SECURITY_TEMPLATE, attempts=attempts.data)
+    except Exception as e:
+        return f"Error: {e}"
+
+# ==========================================
+# ROUTES - SETTINGS
+# ==========================================
+
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings():
+    if request.method == 'POST':
+        try:
+            settings_result = supabase.table('settings').select('*').limit(1).execute()
+            
+            settings_data = {
+                'email_sender': request.form.get('email_sender'),
+                'company_name': request.form.get('company_name'),
+                'company_tagline': request.form.get('company_tagline'),
+                'company_website': request.form.get('company_website'),
+                'company_location': request.form.get('company_location'),
+                'primary_color': request.form.get('primary_color'),
+                'accent_color': request.form.get('accent_color'),
+                'secondary_color': request.form.get('secondary_color'),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            
+            if len(settings_result.data) > 0:
+                supabase.table('settings').update(settings_data).eq('id', settings_result.data[0]['id']).execute()
+            else:
+                supabase.table('settings').insert(settings_data).execute()
+            
+            return redirect(url_for('settings'))
+        except Exception as e:
+            return f"Error: {e}"
+    
+    try:
+        settings_result = supabase.table('settings').select('*').limit(1).execute()
+        settings_data = settings_result.data[0] if len(settings_result.data) > 0 else {}
+        return render_template_string(SETTINGS_TEMPLATE, settings=settings_data)
+    except:
+        return render_template_string(SETTINGS_TEMPLATE, settings={})
+
+# ==========================================
+# ROUTES - PWA
+# ==========================================
+
+@app.route('/manifest.json')
+def manifest():
+    return jsonify({
+        'name': Config.PWA_NAME,
+        'short_name': Config.PWA_SHORT_NAME,
+        'description': f'{Config.COMPANY_NAME} - {Config.COMPANY_TAGLINE}',
+        'start_url': '/',
+        'display': 'standalone',
+        'background_color': '#ffffff',
+        'theme_color': Config.PRIMARY_COLOR,
+        'icons': [
+            {
+                'src': '/static/icon-192.png',
+                'sizes': '192x192',
+                'type': 'image/png',
+                'purpose': 'any maskable'
+            },
+            {
+                'src': '/static/icon-512.png',
+                'sizes': '512x512',
+                'type': 'image/png',
+                'purpose': 'any maskable'
+            }
+        ]
+    })
+
+@app.route('/sw.js')
+def service_worker():
+    return render_template_string(SERVICE_WORKER, mimetype='application/javascript')
+
+@app.route('/favicon.ico')
+def favicon():
+    return send_file('static/favicon.ico', mimetype='image/x-icon')
+
+# ==========================================
+# HTML TEMPLATES - UPDATED WITH BLUE SIDEBAR
+# ==========================================
+
+BASE_STYLE = f"""
+<style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    
+    :root {{
+        --primary: {Config.PRIMARY_COLOR};
+        --accent: {Config.ACCENT_COLOR};
+        --secondary: {Config.SECONDARY_COLOR};
+        --sidebar-bg: linear-gradient(180deg, {Config.PRIMARY_COLOR} 0%, {Config.ACCENT_COLOR} 100%);
+        --text-dark: #1a202c;
+        --text-light: #718096;
+    }}
+    
+    body {{
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #f7fafc;
+        color: var(--text-dark);
+    }}
+    
+    /* Mobile Sidebar - Blue gradient */
+    .mobile-nav {{
+        position: fixed;
+        top: 0;
+        left: -100%;
+        width: 280px;
+        height: 100vh;
+        background: var(--sidebar-bg);
+        transition: left 0.3s ease;
+        z-index: 1000;
+        overflow-y: auto;
+        box-shadow: 4px 0 20px rgba(0,0,0,0.2);
+    }}
+    
+    .mobile-nav.active {{
+        left: 0;
+    }}
+    
+    .mobile-overlay {{
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100vh;
+        background: rgba(0,0,0,0.6);
+        z-index: 999;
+        display: none;
+        backdrop-filter: blur(2px);
+    }}
+    
+    .mobile-overlay.active {{
+        display: block;
+    }}
+    
+    .nav-header {{
+        padding: 30px 20px;
+        background: rgba(255,255,255,0.1);
+        backdrop-filter: blur(10px);
+        color: white;
+        text-align: center;
+        border-bottom: 1px solid rgba(255,255,255,0.2);
+    }}
+    
+    .nav-logo {{
+        width: 70px;
+        height: 70px;
+        margin: 0 auto 15px;
+        background: white;
+        border-radius: 50%;
+        padding: 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }}
+    
+    .nav-logo img {{
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+    }}
+    
+    .nav-header h2 {{
+        font-size: 18px;
+        margin-bottom: 5px;
+        font-weight: 700;
+    }}
+    
+    .nav-header p {{
+        font-size: 11px;
+        opacity: 0.9;
+        font-style: italic;
+    }}
+    
+    .nav-links {{
+        padding: 15px 0;
+    }}
+    
+    .nav-links a {{
+        display: flex;
+        align-items: center;
+        padding: 15px 25px;
+        color: white;
+        text-decoration: none;
+        transition: all 0.3s;
+        font-size: 14px;
+        font-weight: 500;
+        border-left: 4px solid transparent;
+    }}
+    
+    .nav-links a:hover, .nav-links a.active {{
+        background: rgba(255,255,255,0.15);
+        border-left-color: white;
+    }}
+    
+    .nav-links a i {{
+        margin-right: 12px;
+        font-size: 18px;
+        width: 24px;
+        text-align: center;
+    }}
+    
+    /* Top Bar - White background */
+    .top-bar {{
+        position: sticky;
+        top: 0;
+        background: white;
+        padding: 15px 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        z-index: 100;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+    }}
+    
+    .hamburger {{
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        cursor: pointer;
+        padding: 8px;
+        background: var(--primary);
+        border-radius: 8px;
+    }}
+    
+    .hamburger span {{
+        width: 25px;
+        height: 3px;
+        background: white;
+        border-radius: 3px;
+        transition: 0.3s;
+    }}
+    
+    .hamburger.active span:nth-child(1) {{
+        transform: rotate(45deg) translate(6px, 6px);
+    }}
+    
+    .hamburger.active span:nth-child(2) {{
+        opacity: 0;
+    }}
+    
+    .hamburger.active span:nth-child(3) {{
+        transform: rotate(-45deg) translate(6px, -6px);
+    }}
+    
+    .page-title {{
+        font-size: 18px;
+        font-weight: 600;
+        color: var(--text-dark);
+    }}
+    
+    /* Main Content - White background */
+    .main-content {{
+        padding: 20px;
+        max-width: 1400px;
+        margin: 0 auto;
+        background: white;
+        min-height: calc(100vh - 70px);
+    }}
+    
+    /* Cards */
+    .card {{
+        background: white;
+        border-radius: 16px;
+        padding: 25px;
+        margin-bottom: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        border: 1px solid #e5e7eb;
+        transition: transform 0.3s, box-shadow 0.3s;
+    }}
+    
+    .card:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    }}
+    
+    .metric-card {{
+        text-align: center;
+        padding: 25px 20px;
+        background: linear-gradient(135deg, #ffffff 0%, #f7fafc 100%);
+    }}
+    
+    .metric-icon {{
+        width: 50px;
+        height: 50px;
+        margin: 0 auto 15px;
+        background: var(--sidebar-bg);
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 24px;
+        box-shadow: 0 4px 12px rgba(14, 165, 233, 0.3);
+    }}
+    
+    .metric-value {{
+        font-size: 28px;
+        font-weight: 700;
+        color: var(--primary);
+        margin: 10px 0;
+    }}
+    
+    .metric-label {{
+        color: var(--text-light);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        font-weight: 500;
+    }}
+    
+    .metric-change {{
+        font-size: 12px;
+        margin-top: 8px;
+        padding: 4px 10px;
+        border-radius: 20px;
+        display: inline-block;
+        font-weight: 600;
+    }}
+    
+    .metric-change.positive {{
+        background: #d4edda;
+        color: #155724;
+    }}
+    
+    .metric-change.negative {{
+        background: #f8d7da;
+        color: #721c24;
+    }}
+    
+    /* Grid Layout */
+    .grid {{
+        display: grid;
+        gap: 20px;
+    }}
+    
+    .grid-2 {{ grid-template-columns: repeat(2, 1fr); }}
+    .grid-3 {{ grid-template-columns: repeat(3, 1fr); }}
+    .grid-4 {{ grid-template-columns: repeat(4, 1fr); }}
+    
+    @media (max-width: 768px) {{
+        .grid-2, .grid-3, .grid-4 {{ grid-template-columns: 1fr; }}
+    }}
+    
+    /* Buttons */
+    .btn {{
+        padding: 12px 24px;
+        border: none;
+        border-radius: 10px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.3s;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        text-decoration: none;
+    }}
+    
+    .btn-primary {{
+        background: var(--sidebar-bg);
+        color: white;
+        box-shadow: 0 4px 15px rgba(14, 165, 233, 0.3);
+    }}
+    
+    .btn-primary:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(14, 165, 233, 0.4);
+    }}
+    
+    .btn-secondary {{
+        background: white;
+        color: var(--primary);
+        border: 2px solid var(--primary);
+    }}
+    
+    .btn-secondary:hover {{
+        background: var(--primary);
+        color: white;
+    }}
+    
+    .btn-success {{
+        background: linear-gradient(135deg, #10b981, #059669);
+        color: white;
+    }}
+    
+    .btn-danger {{
+        background: linear-gradient(135deg, #ef4444, #dc2626);
+        color: white;
+    }}
+    
+    .btn-sm {{
+        padding: 8px 16px;
+        font-size: 12px;
+    }}
+    
+    /* Forms */
+    .form-group {{
+        margin-bottom: 20px;
+    }}
+    
+    .form-label {{
+        display: block;
+        margin-bottom: 8px;
+        color: var(--text-dark);
+        font-weight: 500;
+        font-size: 14px;
+    }}
+    
+    .form-control {{
+        width: 100%;
+        padding: 12px 16px;
+        border: 2px solid #e5e7eb;
+        border-radius: 10px;
+        font-size: 14px;
+        background: white;
+        transition: all 0.3s;
+    }}
+    
+    .form-control:focus {{
+        outline: none;
+        border-color: var(--primary);
+        box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1);
+    }}
+    
+    /* Modal */
+    .modal {{
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0,0,0,0.6);
+        z-index: 2000;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        backdrop-filter: blur(5px);
+    }}
+    
+    .modal.active {{
+        display: flex;
+    }}
+    
+    .modal-content {{
+        background: white;
+        border-radius: 20px;
+        max-width: 600px;
+        width: 100%;
+        max-height: 90vh;
+        overflow-y: auto;
+        padding: 30px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        animation: modalSlideUp 0.3s ease;
+    }}
+    
+    @keyframes modalSlideUp {{
+        from {{
+            opacity: 0;
+            transform: translateY(50px);
+        }}
+        to {{
+            opacity: 1;
+            transform: translateY(0);
+        }}
+    }}
+    
+    .modal-header {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 20px;
+    }}
+    
+    .modal-title {{
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--primary);
+    }}
+    
+    .modal-close {{
+        background: none;
+        border: none;
+        font-size: 28px;
+        cursor: pointer;
+        color: var(--text-light);
+        padding: 0;
+        width: 30px;
+        height: 30px;
+    }}
+    
+    /* Table */
+    .table-container {{
+        overflow-x: auto;
+        border-radius: 12px;
+        background: white;
+        border: 1px solid #e5e7eb;
+    }}
+    
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+    }}
+    
+    th, td {{
+        padding: 15px;
+        text-align: left;
+        border-bottom: 1px solid #e5e7eb;
+        font-size: 14px;
+    }}
+    
+    th {{
+        background: var(--sidebar-bg);
+        color: white;
+        font-weight: 600;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }}
+    
+    tr:hover {{
+        background: #f7fafc;
+    }}
+    
+    /* Badge */
+    .badge {{
+        display: inline-block;
+        padding: 6px 12px;
+        border-radius: 20px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }}
+    
+    .badge-success {{ background: #d4edda; color: #155724; }}
+    .badge-warning {{ background: #fff3cd; color: #856404; }}
+    .badge-danger {{ background: #f8d7da; color: #721c24; }}
+    .badge-info {{ background: #d1ecf1; color: #0c5460; }}
+    .badge-primary {{ background: #cce5ff; color: #004085; }}
+    
+    /* Chart Container */
+    .chart-container {{
+        position: relative;
+        height: 300px;
+        margin: 20px 0;
+    }}
+    
+    /* Health Score */
+    .health-score {{
+        text-align: center;
+        padding: 40px 20px;
+        background: var(--sidebar-bg);
+        border-radius: 20px;
+        color: white;
+        position: relative;
+        overflow: hidden;
+        box-shadow: 0 8px 24px rgba(14, 165, 233, 0.3);
+    }}
+    
+    .health-score::before {{
+        content: '';
+        position: absolute;
+        top: -50%;
+        right: -50%;
+        width: 200%;
+        height: 200%;
+        background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+    }}
+    
+    .health-score-value {{
+        font-size: 64px;
+        font-weight: 700;
+        margin: 20px 0;
+        position: relative;
+        z-index: 1;
+    }}
+    
+    .health-score-label {{
+        font-size: 16px;
+        opacity: 0.95;
+        position: relative;
+        z-index: 1;
+    }}
+    
+    /* Notifications */
+    .notification {{
+        position: fixed;
+        top: 80px;
+        right: 20px;
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+        border-left: 4px solid var(--primary);
+        z-index: 3000;
+        min-width: 300px;
+        animation: slideInRight 0.3s ease;
+    }}
+    
+    @keyframes slideInRight {{
+        from {{
+            transform: translateX(400px);
+            opacity: 0;
+        }}
+        to {{
+            transform: translateX(0);
+            opacity: 1;
+        }}
+    }}
+    
+    /* Responsive */
+    @media (min-width: 1024px) {{
+        .mobile-nav {{
+            position: fixed;
+            left: 0;
+            width: 260px;
+            border-radius: 0;
+        }}
+        
+        .hamburger {{
+            display: none;
+        }}
+        
+        .main-content {{
+            margin-left: 260px;
+        }}
+        
+        .top-bar {{
+            margin-left: 260px;
+        }}
+    }}
+    
+    /* Utilities */
+    .text-center {{ text-align: center; }}
+    .text-right {{ text-align: right; }}
+    .mt-20 {{ margin-top: 20px; }}
+    .mb-20 {{ margin-bottom: 20px; }}
+    .flex {{ display: flex; }}
+    .flex-between {{ display: flex; justify-content: space-between; align-items: center; }}
+    .gap-10 {{ gap: 10px; }}
+    
+    /* Loading Spinner */
+    .spinner {{
+        border: 3px solid rgba(14, 165, 233, 0.1);
+        border-top: 3px solid var(--primary);
+        border-radius: 50%;
+        width: 40px;
+        height: 40px;
+        animation: spin 1s linear infinite;
+        margin: 20px auto;
+    }}
+    
+    @keyframes spin {{
+        0% {{ transform: rotate(0deg); }}
+        100% {{ transform: rotate(360deg); }}
+    }}
+</style>
+"""
+
+# Continue with template definitions in next message...
+# Continue app.py - ALL HTML TEMPLATES
+
+SETUP_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Setup - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body style="background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 50%, var(--secondary) 100%);">
+    <div style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;">
+        <div style="background: white; max-width: 400px; width: 100%; padding: 40px; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <div style="width: 80px; height: 80px; margin: 0 auto 20px; background: var(--sidebar-bg); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-size: 36px; font-weight: 700; box-shadow: 0 8px 20px rgba(14, 165, 233, 0.3);">D</div>
+                <h1 style="color: var(--primary); font-size: 24px; margin-bottom: 10px;">DeoBiz Manager</h1>
+                <p style="color: var(--text-light); font-style: italic;">Visualising Your Vision</p>
+            </div>
+            <form method="POST">
+                <div class="form-group">
+                    <label class="form-label">Admin Username</label>
+                    <input type="text" name="username" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Admin Password</label>
+                    <input type="password" name="password" class="form-control" required>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">Complete Setup</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+LOGIN_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body style="background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 50%, var(--secondary) 100%);">
+    <div style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;">
+        <div style="background: white; max-width: 400px; width: 100%; padding: 40px; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <img src="/static/icon-192.png" style="width: 80px; height: 80px; margin: 0 auto 20px; border-radius: 50%; box-shadow: 0 8px 20px rgba(14, 165, 233, 0.3);">
+                <h1 style="color: var(--primary); font-size: 24px; margin-bottom: 10px;">Welcome Back</h1>
+                <p style="color: var(--text-light); font-style: italic;">Visualising Your Vision</p>
+            </div>
+            {% if error %}
+            <div style="background: #fee; color: #c33; padding: 12px; border-radius: 10px; margin-bottom: 20px; text-align: center; font-size: 14px; border-left: 4px solid #dc3545;">{{ error }}</div>
+            {% endif %}
+            <form method="POST">
+                <div class="form-group">
+                    <label class="form-label">Username</label>
+                    <input type="text" name="username" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Password</label>
+                    <input type="password" name="password" class="form-control" required>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">🔐 Login with 2FA</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+OTP_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verify OTP - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body style="background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 50%, var(--secondary) 100%);">
+    <div style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;">
+        <div style="background: white; max-width: 400px; width: 100%; padding: 40px; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);">
+            <div style="text-align: center; margin-bottom: 30px;">
+                <div style="width: 80px; height: 80px; margin: 0 auto 20px; background: var(--sidebar-bg); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-size: 36px; box-shadow: 0 8px 20px rgba(14, 165, 233, 0.3);">🔒</div>
+                <h1 style="color: var(--primary); font-size: 24px; margin-bottom: 10px;">Verify OTP</h1>
+                <p style="color: var(--text-light);">Check your email for the verification code</p>
+            </div>
+            {% if error %}
+            <div style="background: #fee; color: #c33; padding: 12px; border-radius: 10px; margin-bottom: 20px; text-align: center; font-size: 14px; border-left: 4px solid #dc3545;">{{ error }}</div>
+            {% endif %}
+            <form method="POST">
+                <div class="form-group">
+                    <label class="form-label">Enter 6-Digit OTP</label>
+                    <input type="text" name="otp" class="form-control" maxlength="6" pattern="[0-9]{6}" style="text-align: center; letter-spacing: 15px; font-size: 28px; font-weight: 700;" required autofocus>
+                    <small style="color: var(--text-light); font-size: 12px; margin-top: 8px; display: block; text-align: center;">Code expires in 10 minutes</small>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">✓ Verify & Login</button>
+            </form>
+        </div>
+    </div>
+    <script>
+        // Show notification when page loads
+        if (window.Notification && Notification.permission === "default") {
+            Notification.requestPermission();
+        }
+        
+        // Auto-focus on OTP input
+        document.querySelector('input[name="otp"]').focus();
+    </script>
+</body>
+</html>
+'''
+CLIENTS_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clients - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients" class="active">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Clients</div>
+        <button class="btn btn-primary btn-sm" onclick="openModal()">+ Add</button>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Email</th>
+                            <th>Phone</th>
+                            <th>Label</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for client in clients %}
+                        <tr>
+                            <td><strong>{{ client.name }}</strong></td>
+                            <td>{{ client.email }}</td>
+                            <td>{{ client.phone }}</td>
+                            <td><span class="badge badge-{{ 'success' if client.label == 'High Value' else 'info' }}">{{ client.label }}</span></td>
+                            <td>
+                                <button class="btn btn-secondary btn-sm" onclick="editClient({{ client.id }}, '{{ client.name }}', '{{ client.email }}', '{{ client.phone }}', '{{ client.company }}', '{{ client.label }}')">Edit</button>
+                                <a href="/clients/delete/{{ client.id }}" class="btn btn-danger btn-sm" onclick="return confirm('Delete?')">Delete</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Add Modal -->
+    <div class="modal" id="addModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Add Client</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <form method="POST" action="/clients/add">
+                <div class="form-group">
+                    <label class="form-label">Name</label>
+                    <input type="text" name="name" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Email</label>
+                    <input type="email" name="email" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Phone</label>
+                    <input type="tel" name="phone" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Company</label>
+                    <input type="text" name="company" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Label</label>
+                    <select name="label" class="form-control">
+                        <option value="New">New</option>
+                        <option value="Repeat">Repeat</option>
+                        <option value="High Value">High Value</option>
+                    </select>
+                </div>
+                <div class="flex gap-10">
+                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Edit Modal -->
+    <div class="modal" id="editModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Edit Client</h3>
+                <button class="modal-close" onclick="closeEditModal()">&times;</button>
+            </div>
+            <form method="POST" id="editForm">
+                <div class="form-group">
+                    <label class="form-label">Name</label>
+                    <input type="text" name="name" id="editName" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Email</label>
+                    <input type="email" name="email" id="editEmail" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Phone</label>
+                    <input type="tel" name="phone" id="editPhone" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Company</label>
+                    <input type="text" name="company" id="editCompany" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Label</label>
+                    <select name="label" id="editLabel" class="form-control">
+                        <option value="New">New</option>
+                        <option value="Repeat">Repeat</option>
+                        <option value="High Value">High Value</option>
+                    </select>
+                </div>
+                <div class="flex gap-10">
+                    <button type="submit" class="btn btn-primary">Update</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeEditModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        function openModal() {
+            document.getElementById('addModal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('addModal').classList.remove('active');
+        }
+        
+        function editClient(id, name, email, phone, company, label) {
+            document.getElementById('editForm').action = '/clients/edit/' + id;
+            document.getElementById('editName').value = name;
+            document.getElementById('editEmail').value = email;
+            document.getElementById('editPhone').value = phone;
+            document.getElementById('editCompany').value = company;
+            document.getElementById('editLabel').value = label;
+            document.getElementById('editModal').classList.add('active');
+        }
+        
+        function closeEditModal() {
+            document.getElementById('editModal').classList.remove('active');
+        }
+    </script>
+</body>
+</html>
+'''
+
+PRICING_CALCULATOR_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pricing Calculator - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator" class="active">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Smart Pricing Calculator</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <h2 style="color: var(--primary); margin-bottom: 10px;">Calculate Project Price</h2>
+            <p style="color: var(--text-light); margin-bottom: 30px;">Get AI-powered pricing recommendations to avoid undercharging</p>
+            
+            <form id="pricingForm">
+                <div class="form-group">
+                    <label class="form-label">Project Type</label>
+                    <select id="projectType" class="form-control" required>
+                        <option value="Web Development">Web Development</option>
+                        <option value="Mobile App">Mobile App</option>
+                        <option value="UI/UX Design">UI/UX Design</option>
+                        <option value="Branding">Branding</option>
+                        <option value="SEO/Marketing">SEO/Marketing</option>
+                        <option value="Content Creation">Content Creation</option>
+                        <option value="Consulting">Consulting</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Estimated Hours</label>
+                    <input type="number" id="estimatedHours" class="form-control" min="1" step="0.5" required>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Complexity</label>
+                    <select id="complexity" class="form-control" required>
+                        <option value="Simple">Simple</option>
+                        <option value="Medium">Medium</option>
+                        <option value="Complex">Complex</option>
+                        <option value="Very Complex">Very Complex</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Urgency</label>
+                    <select id="urgency" class="form-control" required>
+                        <option value="Standard">Standard (2+ weeks)</option>
+                        <option value="Rush (1 week)">Rush (1 week)</option>
+                        <option value="Urgent (3 days)">Urgent (3 days)</option>
+                        <option value="Emergency (24hrs)">Emergency (24 hours)</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Number of Revisions Included</label>
+                    <input type="number" id="revisions" class="form-control" min="0" value="2" required>
+                    <small style="color: var(--text-light);">First 2 revisions are free, additional revisions add UGX 20,000 each</small>
+                </div>
+                
+                <button type="submit" class="btn btn-primary">Calculate Price</button>
+            </form>
+        </div>
+        
+        <div id="resultCard" class="card" style="display: none;">
+            <h3 style="color: var(--primary); margin-bottom: 20px;">Recommended Pricing</h3>
+            
+            <div style="background: linear-gradient(135deg, var(--primary), var(--accent)); color: white; padding: 30px; border-radius: 16px; text-align: center; margin-bottom: 20px;">
+                <div style="font-size: 14px; opacity: 0.9; margin-bottom: 10px;">SUGGESTED PRICE</div>
+                <div style="font-size: 48px; font-weight: 700;" id="suggestedPrice">0</div>
+                <div style="font-size: 14px; opacity: 0.9; margin-top: 10px;">UGX</div>
+            </div>
+            
+            <div class="grid grid-2">
+                <div style="background: rgba(14, 165, 233, 0.1); padding: 20px; border-radius: 12px; text-align: center;">
+                    <div style="color: var(--text-light); font-size: 12px; margin-bottom: 8px;">MINIMUM</div>
+                    <div style="font-size: 24px; font-weight: 600; color: var(--primary);" id="minPrice">0</div>
+                </div>
+                <div style="background: rgba(14, 165, 233, 0.1); padding: 20px; border-radius: 12px; text-align: center;">
+                    <div style="color: var(--text-light); font-size: 12px; margin-bottom: 8px;">MAXIMUM</div>
+                    <div style="font-size: 24px; font-weight: 600; color: var(--primary);" id="maxPrice">0</div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 30px;">
+                <h4 style="color: var(--primary); margin-bottom: 15px;">Price Breakdown</h4>
+                <table style="width: 100%;">
+                    <tr>
+                        <td style="padding: 10px 0; color: var(--text-light);">Base Rate per Hour</td>
+                        <td style="padding: 10px 0; text-align: right; font-weight: 600;" id="baseRate">0</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0; color: var(--text-light);">Total Hours</td>
+                        <td style="padding: 10px 0; text-align: right; font-weight: 600;" id="totalHours">0</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0; color: var(--text-light);">Complexity Multiplier</td>
+                        <td style="padding: 10px 0; text-align: right; font-weight: 600;" id="complexityMult">0x</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0; color: var(--text-light);">Urgency Multiplier</td>
+                        <td style="padding: 10px 0; text-align: right; font-weight: 600;" id="urgencyMult">0x</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0; color: var(--text-light);">Revision Cost</td>
+                        <td style="padding: 10px 0; text-align: right; font-weight: 600;" id="revisionCost">0</td>
+                    </tr>
+                    <tr style="border-top: 2px solid var(--primary);">
+                        <td style="padding: 10px 0; font-weight: 700;">Base Price</td>
+                        <td style="padding: 10px 0; text-align: right; font-weight: 700; color: var(--primary);" id="baseBeforeRevisions">0</td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div style="margin-top: 30px; padding: 20px; background: #fff3cd; border-radius: 12px;">
+                <strong style="color: #856404;">💡 Pro Tip:</strong>
+                <p style="color: #856404; margin-top: 10px; line-height: 1.6;">
+                    This is a recommended range based on industry standards. Consider your experience level, client budget, and project scope when finalizing the price. Don't forget to account for meetings, revisions, and project management time!
+                </p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        document.getElementById('pricingForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const data = {
+                project_type: document.getElementById('projectType').value,
+                estimated_hours: parseFloat(document.getElementById('estimatedHours').value),
+                complexity: document.getElementById('complexity').value,
+                urgency: document.getElementById('urgency').value,
+                revisions: parseInt(document.getElementById('revisions').value)
+            };
+            
+            try {
+                const response = await fetch('/api/calculate-price', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                
+                const result = await response.json();
+                
+                document.getElementById('suggestedPrice').textContent = result.suggested_price.toLocaleString();
+                document.getElementById('minPrice').textContent = 'UGX ' + result.min_price.toLocaleString();
+                document.getElementById('maxPrice').textContent = 'UGX ' + result.max_price.toLocaleString();
+                
+                document.getElementById('baseRate').textContent = 'UGX ' + result.breakdown.base_rate_per_hour.toLocaleString();
+                document.getElementById('totalHours').textContent = result.breakdown.total_hours;
+                document.getElementById('complexityMult').textContent = result.breakdown.complexity_multiplier + 'x';
+                document.getElementById('urgencyMult').textContent = result.breakdown.urgency_multiplier + 'x';
+                document.getElementById('revisionCost').textContent = 'UGX ' + result.breakdown.revision_cost.toLocaleString();
+                document.getElementById('baseBeforeRevisions').textContent = 'UGX ' + result.breakdown.base_before_revisions.toLocaleString();
+                
+                document.getElementById('resultCard').style.display = 'block';
+                document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
+            } catch (error) {
+                alert('Error calculating price: ' + error.message);
+            }
+        });
+    </script>
+</body>
+</html>
+'''
+
+DASHBOARD_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <link rel="manifest" href="/manifest.json">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <!-- Mobile Navigation - Blue Sidebar -->
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <div class="nav-logo">
+                <img src="/static/icon-192.png" alt="Logo">
+            </div>
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard" class="active"><span>📊</span> Dashboard</a>
+            <a href="/clients"><span>👥</span> Clients</a>
+            <a href="/quotations"><span>📝</span> Quotations</a>
+            <a href="/invoices"><span>🧾</span> Invoices</a>
+            <a href="/receipts"><span>📄</span> Receipts</a>
+            <a href="/expenses"><span>💰</span> Expenses</a>
+            <a href="/pricing-calculator"><span>🧮</span> Pricing Calculator</a>
+            <a href="/reports"><span>📈</span> Reports</a>
+            <a href="/security"><span>🔒</span> Security</a>
+            <a href="/settings"><span>⚙️</span> Settings</a>
+            <a href="/logout"><span>🚪</span> Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <!-- Top Bar -->
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">📊 Dashboard</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <!-- Main Content -->
+    <div class="main-content">
+        <!-- Health Score -->
+        <div class="health-score">
+            <div class="health-score-label">Business Health Score</div>
+            <div class="health-score-value">{{ "%.0f"|format(health_score) }}</div>
+            <div style="font-size: 14px; opacity: 0.9;">Out of 100</div>
+        </div>
+        
+        <!-- Metrics Grid -->
+        <div class="grid grid-2">
+            <div class="card metric-card">
+                <div class="metric-icon">💵</div>
+                <div class="metric-label">Today's Revenue</div>
+                <div class="metric-value">{{ "{:,.0f}".format(today_revenue) }}</div>
+                <div class="metric-change positive">+{{ "%.1f"|format(revenue_growth) }}%</div>
+            </div>
+            
+            <div class="card metric-card">
+                <div class="metric-icon">📅</div>
+                <div class="metric-label">Weekly Revenue</div>
+                <div class="metric-value">{{ "{:,.0f}".format(week_revenue) }}</div>
+            </div>
+            
+            <div class="card metric-card">
+                <div class="metric-icon">📆</div>
+                <div class="metric-label">Monthly Revenue</div>
+                <div class="metric-value">{{ "{:,.0f}".format(month_revenue) }}</div>
+            </div>
+            
+            <div class="card metric-card">
+                <div class="metric-icon">💸</div>
+                <div class="metric-label">Total Expenses</div>
+                <div class="metric-value">{{ "{:,.0f}".format(total_expenses) }}</div>
+            </div>
+            
+            <div class="card metric-card">
+                <div class="metric-icon">💰</div>
+                <div class="metric-label">Net Profit</div>
+                <div class="metric-value">{{ "{:,.0f}".format(net_profit) }}</div>
+                <div class="metric-change {{ 'positive' if profit_margin > 0 else 'negative' }}">{{ "%.1f"|format(profit_margin) }}%</div>
+            </div>
+            
+            <div class="card metric-card">
+                <div class="metric-icon">📋</div>
+                <div class="metric-label">Outstanding</div>
+                <div class="metric-value">{{ "{:,.0f}".format(outstanding) }}</div>
+            </div>
+        </div>
+        
+        <!-- Revenue Chart -->
+        <div class="card">
+            <h3 style="margin-bottom: 20px; color: var(--primary);">📈 Revenue Trend (Last 6 Months)</h3>
+            <div class="chart-container">
+                <canvas id="revenueChart"></canvas>
+            </div>
+        </div>
+        
+        <!-- Top Clients -->
+        <div class="card">
+            <h3 style="margin-bottom: 20px; color: var(--primary);">⭐ Top Clients</h3>
+            {% if top_clients %}
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Client</th>
+                            <th>Revenue</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for client in top_clients %}
+                        <tr>
+                            <td><strong>{{ client.name }}</strong></td>
+                            <td>UGX {{ "{:,.0f}".format(client.revenue) }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p style="text-align: center; color: var(--text-light); padding: 20px;">No client data yet</p>
+            {% endif %}
+        </div>
+        
+        <!-- Expense Breakdown -->
+        <div class="card">
+            <h3 style="margin-bottom: 20px; color: var(--primary);">💸 Expense Breakdown</h3>
+            <div class="chart-container">
+                <canvas id="expenseChart"></canvas>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Toggle Navigation
+        function toggleNav() {
+            const nav = document.getElementById('mobileNav');
+            const overlay = document.getElementById('mobileOverlay');
+            const hamburger = document.getElementById('hamburger');
+            
+            nav.classList.toggle('active');
+            overlay.classList.toggle('active');
+            hamburger.classList.toggle('active');
+        }
+        
+        // Register Service Worker
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js');
+        }
+        
+        // Request notification permission
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
+        
+        // Revenue Chart
+        const revenueCtx = document.getElementById('revenueChart').getContext('2d');
+        new Chart(revenueCtx, {
+            type: 'line',
+            data: {
+                labels: {{ monthly_revenue|map(attribute='month')|list|tojson }},
+                datasets: [{
+                    label: 'Revenue',
+                    data: {{ monthly_revenue|map(attribute='revenue')|list|tojson }},
+                    borderColor: 'rgb(14, 165, 233)',
+                    backgroundColor: 'rgba(14, 165, 233, 0.1)',
+                    tension: 0.4,
+                    fill: true,
+                    borderWidth: 3
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            callback: function(value) {
+                                return 'UGX ' + value.toLocaleString();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        // Expense Chart
+        const expenseCtx = document.getElementById('expenseChart').getContext('2d');
+        new Chart(expenseCtx, {
+            type: 'doughnut',
+            data: {
+                labels: {{ expense_by_category.keys()|list|tojson }},
+                datasets: [{
+                    data: {{ expense_by_category.values()|list|tojson }},
+                    backgroundColor: [
+                        'rgba(14, 165, 233, 0.8)',
+                        'rgba(2, 132, 199, 0.8)',
+                        'rgba(6, 182, 212, 0.8)',
+                        'rgba(16, 185, 129, 0.8)',
+                        'rgba(245, 158, 11, 0.8)',
+                        'rgba(239, 68, 68, 0.8)'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+'''
+
+QUOTATIONS_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quotations - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations" class="active">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Quotations</div>
+        <button class="btn btn-primary btn-sm" onclick="openModal()">+ New</button>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Client</th>
+                            <th>Date</th>
+                            <th>Amount</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for quot in quotations %}
+                        <tr>
+                            <td><strong>{{ quot.number }}</strong></td>
+                            <td>Client #{{ quot.client_id }}</td>
+                            <td>{{ quot.date[:10] }}</td>
+                            <td>UGX {{ "{:,.0f}".format(quot.total) }}</td>
+                            <td><span class="badge badge-{{ 'success' if quot.status == 'converted' else 'warning' }}">{{ quot.status }}</span></td>
+                            <td>
+                                {% if quot.status != 'converted' %}
+                                <a href="/quotations/convert/{{ quot.id }}" class="btn btn-success btn-sm">→ Invoice</a>
+                                {% endif %}
+                                <a href="/quotations/pdf/{{ quot.id }}" class="btn btn-secondary btn-sm">PDF</a>
+                                <a href="/quotations/email/{{ quot.id }}" class="btn btn-primary btn-sm">Email</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Add Modal -->
+    <div class="modal" id="addModal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div class="modal-header">
+                <h3 class="modal-title">Create Quotation</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <form method="POST" action="/quotations/add" onsubmit="return prepareSubmit()">
+                <div class="form-group">
+                    <label class="form-label">Client</label>
+                    <select name="client_id" class="form-control" required>
+                        {% for client in clients %}
+                        <option value="{{ client.id }}">{{ client.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Validity Date</label>
+                    <input type="date" name="validity_date" class="form-control" required>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Line Items</label>
+                    <div id="items">
+                        <div class="item-row" style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; margin-bottom: 10px; align-items: center;">
+                            <input type="text" placeholder="Description" class="form-control item-desc" required>
+                            <input type="number" placeholder="Qty" class="form-control item-qty" value="1" min="1" required>
+                            <input type="number" placeholder="Rate" class="form-control item-rate" min="0" required>
+                            <input type="number" placeholder="Amount" class="form-control item-amount" readonly>
+                            <button type="button" onclick="removeItem(this)" class="btn btn-danger btn-sm">×</button>
+                        </div>
+                    </div>
+                    <button type="button" onclick="addItem()" class="btn btn-secondary btn-sm">+ Add Item</button>
+                </div>
+                
+                <div class="grid grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Tax (UGX)</label>
+                        <input type="number" name="tax" class="form-control" value="0" min="0" step="0.01">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Discount (UGX)</label>
+                        <input type="number" name="discount" class="form-control" value="0" min="0" step="0.01">
+                    </div>
+                </div>
+                
+                <input type="hidden" name="items" id="items-data">
+                
+                <div class="flex gap-10">
+                    <button type="submit" class="btn btn-primary">Create Quotation</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        function openModal() {
+            document.getElementById('addModal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('addModal').classList.remove('active');
+        }
+        
+        function addItem() {
+            const container = document.getElementById('items');
+            const div = document.createElement('div');
+            div.className = 'item-row';
+            div.style.cssText = 'display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; margin-bottom: 10px; align-items: center;';
+            div.innerHTML = `
+                <input type="text" placeholder="Description" class="form-control item-desc" required>
+                <input type="number" placeholder="Qty" class="form-control item-qty" value="1" min="1" required>
+                <input type="number" placeholder="Rate" class="form-control item-rate" min="0" required>
+                <input type="number" placeholder="Amount" class="form-control item-amount" readonly>
+                <button type="button" onclick="removeItem(this)" class="btn btn-danger btn-sm">×</button>
+            `;
+            container.appendChild(div);
+            attachCalculators();
+        }
+        
+        function removeItem(btn) {
+            if (document.querySelectorAll('.item-row').length > 1) {
+                btn.parentElement.remove();
+            }
+        }
+        
+        function attachCalculators() {
+            document.querySelectorAll('.item-qty, .item-rate').forEach(input => {
+                input.removeEventListener('input', calculateItem);
+                input.addEventListener('input', calculateItem);
+            });
+        }
+        
+        function calculateItem(e) {
+            const row = e.target.closest('.item-row');
+            const qty = parseFloat(row.querySelector('.item-qty').value) || 0;
+            const rate = parseFloat(row.querySelector('.item-rate').value) || 0;
+            row.querySelector('.item-amount').value = (qty * rate).toFixed(2);
+        }
+        
+        function prepareSubmit() {
+            const items = [];
+            document.querySelectorAll('.item-row').forEach(row => {
+                items.push({
+                    description: row.querySelector('.item-desc').value,
+                    quantity: parseFloat(row.querySelector('.item-qty').value),
+                    rate: parseFloat(row.querySelector('.item-rate').value),
+                    amount: parseFloat(row.querySelector('.item-amount').value)
+                });
+            });
+            document.getElementById('items-data').value = JSON.stringify(items);
+            return true;
+        }
+        
+        attachCalculators();
+    </script>
+</body>
+</html>
+'''
+
+INVOICES_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoices - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices" class="active">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Invoices</div>
+        <button class="btn btn-primary btn-sm" onclick="openModal()">+ New</button>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Client</th>
+                            <th>Date</th>
+                            <th>Amount</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for inv in invoices %}
+                        <tr>
+                            <td><strong>{{ inv.number }}</strong></td>
+                            <td>Client #{{ inv.client_id }}</td>
+                            <td>{{ inv.date[:10] }}</td>
+                            <td>UGX {{ "{:,.0f}".format(inv.total) }}</td>
+                            <td><span class="badge badge-{{ 'success' if inv.status == 'paid' else 'warning' }}">{{ inv.status }}</span></td>
+                            <td>
+                                {% if inv.status == 'pending' %}
+                                <a href="/invoices/mark-paid/{{ inv.id }}" class="btn btn-success btn-sm">Mark Paid</a>
+                                {% endif %}
+                                <a href="/invoices/pdf/{{ inv.id }}" class="btn btn-secondary btn-sm">PDF</a>
+                                <a href="/invoices/email/{{ inv.id }}" class="btn btn-primary btn-sm">Email</a>
+                                <a href="/invoices/whatsapp/{{ inv.id }}" class="btn btn-success btn-sm">WhatsApp</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Add Modal -->
+    <div class="modal" id="addModal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div class="modal-header">
+                <h3 class="modal-title">Create Invoice</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <form method="POST" action="/invoices/add" onsubmit="return prepareSubmit()">
+                <div class="form-group">
+                    <label class="form-label">Client</label>
+                    <select name="client_id" class="form-control" required>
+                        {% for client in clients %}
+                        <option value="{{ client.id }}">{{ client.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Line Items</label>
+                    <div id="items">
+                        <div class="item-row" style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; margin-bottom: 10px; align-items: center;">
+                            <input type="text" placeholder="Description" class="form-control item-desc" required>
+                            <input type="number" placeholder="Qty" class="form-control item-qty" value="1" min="1" required>
+                            <input type="number" placeholder="Rate" class="form-control item-rate" min="0" required>
+                            <input type="number" placeholder="Amount" class="form-control item-amount" readonly>
+                            <button type="button" onclick="removeItem(this)" class="btn btn-danger btn-sm">×</button>
+                        </div>
+                    </div>
+                    <button type="button" onclick="addItem()" class="btn btn-secondary btn-sm">+ Add Item</button>
+                </div>
+                
+                <div class="grid grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Tax (UGX)</label>
+                        <input type="number" name="tax" class="form-control" value="0" min="0" step="0.01">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Discount (UGX)</label>
+                        <input type="number" name="discount" class="form-control" value="0" min="0" step="0.01">
+                    </div>
+                </div>
+                
+                <input type="hidden" name="items" id="items-data">
+                
+                <div class="flex gap-10">
+                    <button type="submit" class="btn btn-primary">Create Invoice</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        function openModal() {
+            document.getElementById('addModal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('addModal').classList.remove('active');
+        }
+        
+        function addItem() {
+            const container = document.getElementById('items');
+            const div = document.createElement('div');
+            div.className = 'item-row';
+            div.style.cssText = 'display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto; gap: 10px; margin-bottom: 10px; align-items: center;';
+            div.innerHTML = `
+                <input type="text" placeholder="Description" class="form-control item-desc" required>
+                <input type="number" placeholder="Qty" class="form-control item-qty" value="1" min="1" required>
+                <input type="number" placeholder="Rate" class="form-control item-rate" min="0" required>
+                <input type="number" placeholder="Amount" class="form-control item-amount" readonly>
+                <button type="button" onclick="removeItem(this)" class="btn btn-danger btn-sm">×</button>
+            `;
+            container.appendChild(div);
+            attachCalculators();
+        }
+        
+        function removeItem(btn) {
+            if (document.querySelectorAll('.item-row').length > 1) {
+                btn.parentElement.remove();
+            }
+        }
+        
+        function attachCalculators() {
+            document.querySelectorAll('.item-qty, .item-rate').forEach(input => {
+                input.removeEventListener('input', calculateItem);
+                input.addEventListener('input', calculateItem);
+            });
+        }
+        
+        function calculateItem(e) {
+            const row = e.target.closest('.item-row');
+            const qty = parseFloat(row.querySelector('.item-qty').value) || 0;
+            const rate = parseFloat(row.querySelector('.item-rate').value) || 0;
+            row.querySelector('.item-amount').value = (qty * rate).toFixed(2);
+        }
+        
+        function prepareSubmit() {
+            const items = [];
+            document.querySelectorAll('.item-row').forEach(row => {
+                items.push({
+                    description: row.querySelector('.item-desc').value,
+                    quantity: parseFloat(row.querySelector('.item-qty').value),
+                    rate: parseFloat(row.querySelector('.item-rate').value),
+                    amount: parseFloat(row.querySelector('.item-amount').value)
+                });
+            });
+            document.getElementById('items-data').value = JSON.stringify(items);
+            return true;
+        }
+        
+        attachCalculators();
+    </script>
+</body>
+</html>
+'''
+
+RECEIPTS_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Receipts - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts" class="active">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Receipts</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Invoice</th>
+                            <th>Date</th>
+                            <th>Amount</th>
+                            <th>Payment Method</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for rec in receipts %}
+                        <tr>
+                            <td><strong>{{ rec.number }}</strong></td>
+                            <td>INV #{{ rec.invoice_id }}</td>
+                            <td>{{ rec.date[:10] }}</td>
+                            <td>UGX {{ "{:,.0f}".format(rec.amount) }}</td>
+                            <td><span class="badge badge-info">{{ rec.payment_method }}</span></td>
+                            <td>
+                                <a href="/receipts/pdf/{{ rec.id }}" class="btn btn-primary btn-sm">Download PDF</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+    </script>
+</body>
+</html>
+'''
+
+EXPENSES_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Expenses - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses" class="active">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Expenses</div>
+        <button class="btn btn-primary btn-sm" onclick="openModal()">+ Add</button>
+    </div>
+    
+    <div class="main-content">
+        <!-- Total Expense Card -->
+        <div class="card" style="background: linear-gradient(135deg, var(--accent), var(--secondary)); color: white; text-align: center; padding: 30px;">
+            <div style="font-size: 14px; opacity: 0.9; margin-bottom: 10px;">TOTAL EXPENSES</div>
+            <div style="font-size: 42px; font-weight: 700;">UGX {{ "{:,.0f}".format(total) }}</div>
+        </div>
+        
+        <!-- Expense by Category Chart -->
+        <div class="card">
+            <h3 style="color: var(--primary); margin-bottom: 20px;">Expenses by Category</h3>
+            <div class="chart-container">
+                <canvas id="expenseChart"></canvas>
+            </div>
+        </div>
+        
+        <!-- Expense List -->
+        <div class="card">
+            <h3 style="color: var(--primary); margin-bottom: 20px;">Expense History</h3>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Category</th>
+                            <th>Description</th>
+                            <th>Amount</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for exp in expenses %}
+                        <tr>
+                            <td>{{ exp.date[:10] }}</td>
+                            <td><span class="badge badge-info">{{ exp.category }}</span></td>
+                            <td>{{ exp.description }}</td>
+                            <td><strong>UGX {{ "{:,.0f}".format(exp.amount) }}</strong></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Add Modal -->
+    <div class="modal" id="addModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">Add Expense</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <form method="POST" action="/expenses/add">
+                <div class="form-group">
+                    <label class="form-label">Category</label>
+                    <select name="category" class="form-control" required>
+                        <option value="Office Supplies">Office Supplies</option>
+                        <option value="Software">Software</option>
+                        <option value="Marketing">Marketing</option>
+                        <option value="Utilities">Utilities</option>
+                        <option value="Travel">Travel</option>
+                        <option value="Equipment">Equipment</option>
+                        <option value="Salaries">Salaries</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Description</label>
+                    <input type="text" name="description" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Amount (UGX)</label>
+                    <input type="number" name="amount" class="form-control" min="0" step="0.01" required>
+                </div>
+                <div class="flex gap-10">
+                    <button type="submit" class="btn btn-primary">Save Expense</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        function openModal() {
+            document.getElementById('addModal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('addModal').classList.remove('active');
+        }
+        
+        // Expense Chart
+        const ctx = document.getElementById('expenseChart').getContext('2d');
+        new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: {{ by_category.keys()|list|tojson }},
+                datasets: [{
+                    label: 'Expenses',
+                    data: {{ by_category.values()|list|tojson }},
+                    backgroundColor: 'rgba(14, 165, 233, 0.6)',
+                    borderColor: 'rgba(14, 165, 233, 1)',
+                    borderWidth: 2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            callback: function(value) {
+                                return 'UGX ' + value.toLocaleString();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+'''
+
+REPORTS_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reports - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports" class="active">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Reports</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <h2 style="color: var(--primary); margin-bottom: 20px;">Generate Custom Report</h2>
+            
+            <form method="POST" action="/reports/generate">
+                <div class="form-group">
+                    <label class="form-label">Report Type</label>
+                    <select name="report_type" class="form-control" required>
+                        <option value="revenue">Revenue Report</option>
+                        <option value="expenses">Expense Report</option>
+                        <option value="clients">Client List</option>
+                        <option value="profit">Profit & Loss</option>
+                    </select>
+                </div>
+                
+                <div class="grid grid-2">
+                    <div class="form-group">
+                        <label class="form-label">Start Date</label>
+                        <input type="date" name="start_date" class="form-control" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">End Date</label>
+                        <input type="date" name="end_date" class="form-control" required>
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn btn-primary">Generate & Download CSV</button>
+            </form>
+        </div>
+        
+        <div class="card">
+            <h3 style="color: var(--primary); margin-bottom: 20px;">Quick Reports</h3>
+            <div class="grid grid-2">
+                <button class="btn btn-secondary" onclick="downloadReport('revenue')">📊 This Month Revenue</button>
+                <button class="btn btn-secondary" onclick="downloadReport('expenses')">💸 This Month Expenses</button>
+                <button class="btn btn-secondary" onclick="downloadReport('clients')">👥 All Clients</button>
+                <button class="btn btn-secondary" onclick="downloadReport('profit')">💰 Profit/Loss</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        function downloadReport(type) {
+            const today = new Date();
+            const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+            const startDate = firstDay.toISOString().split('T')[0];
+            const endDate = today.toISOString().split('T')[0];
+            
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/reports/generate';
+            
+            const typeInput = document.createElement('input');
+            typeInput.type = 'hidden';
+            typeInput.name = 'report_type';
+            typeInput.value = type;
+            form.appendChild(typeInput);
+            
+            const startInput = document.createElement('input');
+            startInput.type = 'hidden';
+            startInput.name = 'start_date';
+            startInput.value = startDate;
+            form.appendChild(startInput);
+            
+            const endInput = document.createElement('input');
+            endInput.type = 'hidden';
+            endInput.name = 'end_date';
+            endInput.value = endDate;
+            form.appendChild(endInput);
+            
+            document.body.appendChild(form);
+            form.submit();
+            document.body.removeChild(form);
+        }
+    </script>
+</body>
+</html>
+'''
+
+SECURITY_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security" class="active">🔒 Security</a>
+            <a href="/settings">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Security Dashboard</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <h2 style="color: var(--primary); margin-bottom: 20px;">🔒 Login Activity Log</h2>
+            <p style="color: var(--text-light); margin-bottom: 20px;">Monitor all login attempts and security events</p>
+            
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>IP Address</th>
+                            <th>Timestamp</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for attempt in attempts %}
+                        <tr>
+                            <td><strong>{{ attempt.username }}</strong></td>
+                            <td>{{ attempt.ip_address }}</td>
+                            <td>{{ attempt.timestamp[:19].replace('T', ' ') }}</td>
+                            <td>
+                                {% if attempt.success %}
+                                <span class="badge badge-success">✓ Success</span>
+                                {% else %}
+                                <span class="badge badge-danger">✗ Failed</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="card" style="background: linear-gradient(135deg, #10b981, #059669); color: white;">
+            <h3 style="margin-bottom: 15px;">🛡️ Security Features Active</h3>
+            <ul style="list-style: none; padding: 0;">
+                <li style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.2);">✓ Two-Factor Authentication (2FA)</li>
+                <li style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.2);">✓ IP Blocking after 5 failed attempts</li>
+                <li style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.2);">✓ Email alerts for suspicious activity</li>
+                <li style="padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,0.2);">✓ Password hashing & encryption</li>
+                <li style="padding: 10px 0;">✓ Session timeout protection</li>
+            </ul>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+    </script>
+</body>
+</html>
+'''
+
+SETTINGS_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/clients">👥 Clients</a>
+            <a href="/quotations">📝 Quotations</a>
+            <a href="/invoices">🧾 Invoices</a>
+            <a href="/receipts">📄 Receipts</a>
+            <a href="/expenses">💰 Expenses</a>
+            <a href="/pricing-calculator">🧮 Pricing Calculator</a>
+            <a href="/reports">📈 Reports</a>
+            <a href="/security">🔒 Security</a>
+            <a href="/settings" class="active">⚙️ Settings</a>
+            <a href="/logout">🚪 Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">Settings</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <div class="main-content">
+        <div class="card">
+            <h2 style="color: var(--primary); margin-bottom: 10px;">⚙️ Company Settings</h2>
+            <p style="color: var(--text-light); margin-bottom: 30px;">Manage your business information and branding</p>
+            
+            <form method="POST">
+                <h3 style="color: var(--primary); margin-bottom: 15px;">Email Configuration</h3>
+                <div class="form-group">
+                    <label class="form-label">Email Sender</label>
+                    <input type="email" name="email_sender" class="form-control" value="{{ settings.get('email_sender', 'deoug45@gmail.com') }}">
+                </div>
+                
+                <hr style="margin: 30px 0; border: none; border-top: 1px solid #e5e7eb;">
+                
+                <h3 style="color: var(--primary); margin-bottom: 15px;">Company Information</h3>
+                <div class="form-group">
+                    <label class="form-label">Company Name</label>
+                    <input type="text" name="company_name" class="form-control" value="{{ settings.get('company_name', 'Deo Digital Solutions') }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Company Tagline</label>
+                    <input type="text" name="company_tagline" class="form-control" value="{{ settings.get('company_tagline', 'Visualising Your Vision') }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Website</label>
+                    <input type="text" name="company_website" class="form-control" value="{{ settings.get('company_website', 'www.deodigitalsolutions.com') }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Location</label>
+                    <input type="text" name="company_location" class="form-control" value="{{ settings.get('company_location', 'Kampala, Uganda') }}">
+                </div>
+                
+                <hr style="margin: 30px 0; border: none; border-top: 1px solid #e5e7eb;">
+                
+                <h3 style="color: var(--primary); margin-bottom: 15px;">Brand Colors</h3>
+                <div class="grid grid-3">
+                    <div class="form-group">
+                        <label class="form-label">Primary Color</label>
+                        <input type="color" name="primary_color" class="form-control" value="{{ settings.get('primary_color', '#0EA5E9') }}" style="height: 60px;">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Accent Color</label>
+                        <input type="color" name="accent_color" class="form-control" value="{{ settings.get('accent_color', '#0284C7') }}" style="height: 60px;">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Secondary Color</label>
+                        <input type="color" name="secondary_color" class="form-control" value="{{ settings.get('secondary_color', '#06B6D4') }}" style="height: 60px;">
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn btn-primary">💾 Save Settings</button>
+            </form>
+        </div>
+        
+        <div class="card" style="background: #fff3cd;">
+            <h3 style="color: #856404; margin-bottom: 10px;">ℹ️ Note</h3>
+            <p style="color: #856404; line-height: 1.6;">
+                Changes to company settings will be applied immediately to all documents, emails, and PDFs. 
+                Make sure to test your changes before sending documents to clients.
+            </p>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+    </script>
+</body>
+</html>
+'''
+# For brevity, I'll provide the key templates. The pattern is the same for all:
+# - Blue sidebar navigation
+# - White content area
+# - Consistent styling
+
+SETTINGS_TEMPLATE = BASE_STYLE + '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - DeoBiz Manager</title>
+    <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="mobile-nav" id="mobileNav">
+        <div class="nav-header">
+            <div class="nav-logo">
+                <img src="/static/icon-192.png" alt="Logo">
+            </div>
+            <h2>DeoBiz Manager</h2>
+            <p>Visualising Your Vision</p>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard"><span>📊</span> Dashboard</a>
+            <a href="/clients"><span>👥</span> Clients</a>
+            <a href="/quotations"><span>📝</span> Quotations</a>
+            <a href="/invoices"><span>🧾</span> Invoices</a>
+            <a href="/receipts"><span>📄</span> Receipts</a>
+            <a href="/expenses"><span>💰</span> Expenses</a>
+            <a href="/pricing-calculator"><span>🧮</span> Pricing Calculator</a>
+            <a href="/reports"><span>📈</span> Reports</a>
+            <a href="/security"><span>🔒</span> Security</a>
+            <a href="/settings" class="active"><span>⚙️</span> Settings</a>
+            <a href="/logout"><span>🚪</span> Logout</a>
+        </div>
+    </div>
+    
+    <div class="mobile-overlay" id="mobileOverlay" onclick="toggleNav()"></div>
+    
+    <div class="top-bar">
+        <div class="hamburger" id="hamburger" onclick="toggleNav()">
+            <span></span>
+            <span></span>
+            <span></span>
+        </div>
+        <div class="page-title">⚙️ Settings</div>
+        <div style="width: 40px;"></div>
+    </div>
+    
+    <div class="main-content">
+        <!-- Logo Upload Section -->
+        <div class="card">
+            <h2 style="color: var(--primary); margin-bottom: 10px;">🖼️ Upload Company Logo</h2>
+            <p style="color: var(--text-light); margin-bottom: 20px; font-size: 14px;">Upload your logo to use it in PDFs, emails, and as app icon</p>
+            
+            <form id="logoForm" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label class="form-label">Choose Logo Image (PNG recommended)</label>
+                    <input type="file" id="logoInput" name="logo" accept="image/*" class="form-control">
+                    <small style="color: var(--text-light); font-size: 12px; margin-top: 5px; display: block;">
+                        • Recommended size: 512x512 pixels<br>
+                        • Format: PNG with transparent background<br>
+                        • Will be used for: PWA icons, PDFs, emails, favicon
+                    </small>
+                </div>
+                <button type="submit" class="btn btn-primary">📤 Upload Logo</button>
+            </form>
+            
+            <div style="margin-top: 20px; padding: 15px; background: #e6f7ff; border-radius: 10px; border-left: 4px solid var(--primary);">
+                <strong style="color: var(--primary);">Current Logo Preview:</strong>
+                <div style="margin-top: 10px;">
+                    <img src="/static/icon-192.png" style="width: 80px; height: 80px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2 style="color: var(--primary); margin-bottom: 10px;">⚙️ Company Settings</h2>
+            <p style="color: var(--text-light); margin-bottom: 30px; font-size: 14px;">Manage your business information and branding</p>
+            
+            <form method="POST">
+                <h3 style="color: var(--primary); margin-bottom: 15px; font-size: 18px;">📧 Email Configuration</h3>
+                <div class="form-group">
+                    <label class="form-label">Email Sender</label>
+                    <input type="email" name="email_sender" class="form-control" value="{{ settings.get('email_sender', 'deoug45@gmail.com') }}">
+                </div>
+                
+                <hr style="margin: 30px 0; border: none; border-top: 1px solid #e5e7eb;">
+                
+                <h3 style="color: var(--primary); margin-bottom: 15px; font-size: 18px;">🏢 Company Information</h3>
+                <div class="form-group">
+                    <label class="form-label">Company Name</label>
+                    <input type="text" name="company_name" class="form-control" value="{{ settings.get('company_name', 'Deo Digital Solutions') }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Company Tagline</label>
+                    <input type="text" name="company_tagline" class="form-control" value="{{ settings.get('company_tagline', 'Visualising Your Vision') }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Website</label>
+                    <input type="text" name="company_website" class="form-control" value="{{ settings.get('company_website', 'www.deodigitalsolutions.com') }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Location</label>
+                    <input type="text" name="company_location" class="form-control" value="{{ settings.get('company_location', 'Kampala, Uganda') }}">
+                </div>
+                
+                <hr style="margin: 30px 0; border: none; border-top: 1px solid #e5e7eb;">
+                
+                <h3 style="color: var(--primary); margin-bottom: 15px; font-size: 18px;">🎨 Brand Colors (3 Color Scheme)</h3>
+                <div class="grid grid-3">
+                    <div class="form-group">
+                        <label class="form-label">Primary Color (Sky Blue)</label>
+                        <input type="color" name="primary_color" class="form-control" value="{{ settings.get('primary_color', '#0EA5E9') }}" style="height: 60px;">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Accent Color (Blue)</label>
+                        <input type="color" name="accent_color" class="form-control" value="{{ settings.get('accent_color', '#0284C7') }}" style="height: 60px;">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Secondary Color (Cyan)</label>
+                        <input type="color" name="secondary_color" class="form-control" value="{{ settings.get('secondary_color', '#06B6D4') }}" style="height: 60px;">
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn btn-primary">💾 Save Settings</button>
+            </form>
+        </div>
+        
+        <div class="card" style="background: #fff3cd; border-color: #ffc107;">
+            <h3 style="color: #856404; margin-bottom: 10px;">ℹ️ Important Note</h3>
+            <p style="color: #856404; line-height: 1.6; font-size: 14px;">
+                • Changes to settings will apply immediately to all documents and emails<br>
+                • Logo changes require page refresh to see updates<br>
+                • Make sure to test your changes before sending to clients<br>
+                • Keep your logo file in uploads folder as "logo.png"
+            </p>
+        </div>
+    </div>
+    
+    <script>
+        function toggleNav() {
+            document.getElementById('mobileNav').classList.toggle('active');
+            document.getElementById('mobileOverlay').classList.toggle('active');
+            document.getElementById('hamburger').classList.toggle('active');
+        }
+        
+        // Handle logo upload
+        document.getElementById('logoForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = new FormData();
+            const logoFile = document.getElementById('logoInput').files[0];
+            
+            if (!logoFile) {
+                alert('Please select a logo file');
+                return;
+            }
+            
+            formData.append('logo', logoFile);
+            
+            try {
+                const response = await fetch('/upload-logo', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert('✅ Logo uploaded successfully! Refreshing page...');
+                    window.location.reload();
+                } else {
+                    alert('❌ Error: ' + result.error);
+                }
+            } catch (error) {
+                alert('❌ Upload failed: ' + error.message);
+            }
+        });
+    </script>
+</body>
+</html>
+'''
+
+SERVICE_WORKER = '''
+const CACHE_NAME = 'deobiz-v2';
+const urlsToCache = [
+  '/',
+  '/dashboard',
+  '/clients',
+  '/quotations',
+  '/invoices',
+  '/expenses',
+  '/manifest.json',
+  '/static/icon-192.png',
+  '/static/icon-512.png',
+  '/static/favicon.ico'
+];
+
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(urlsToCache))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('fetch', event => {
+  event.respondWith(
+    caches.match(event.request)
+      .then(response => response || fetch(event.request))
+  );
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(cacheNames => {
+      return Promise.all(
+        cacheNames.map(cacheName => {
+          if (cacheName !== CACHE_NAME) {
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    })
+  );
+  return self.clients.claim();
+});
+
+// Push notification support
+self.addEventListener('push', event => {
+  const data = event.data.json();
+  const options = {
+    body: data.body,
+    icon: '/static/icon-192.png',
+    badge: '/static/icon-192.png',
+    vibrate: [200, 100, 200]
+  };
+  
+  event.waitUntil(
+    self.registration.showNotification(data.title, options)
+  );
+});
+'''
+
+# Copy remaining templates (Clients, Quotations, Invoices, etc.) with same pattern
+# They all follow the same structure with blue sidebar and white content
+
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=Config.DEBUG, host='0.0.0.0', port=8000)
